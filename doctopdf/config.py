@@ -57,6 +57,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Shell command run after each export. ``$1`` and $DOCTOPDF_PRIMARY are the
     # primary file path; $DOCTOPDF_FILES lists all; $DOCTOPDF_DOC_NAME the name.
     "post_export_cmd": None,
+    # Post a macOS notification on each export.
+    "notify": False,
 }
 
 

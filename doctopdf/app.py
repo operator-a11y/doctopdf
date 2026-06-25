@@ -23,6 +23,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import objc
@@ -31,6 +32,8 @@ from AppKit import (
     NSAlertFirstButtonReturn,
     NSApplication,
     NSApplicationActivationPolicyAccessory,
+    NSControlStateValueOff,
+    NSControlStateValueOn,
     NSMenu,
     NSMenuItem,
     NSStatusBar,
@@ -40,9 +43,11 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSObject
 
-from . import config, drive, pipeline
+from . import config, drive, launchagent, pipeline
 from .drive import AuthFlowError, DriveError, ReauthRequired
 from .pipeline import sanitize_filename  # re-exported for convenience
+
+RECENT_MAX = 15  # entries kept in the "Recent exports" submenu
 
 # Status-item title: a visible text label (easy to find in a crowded menu bar)
 # plus a leading state glyph. Pure emoji renders as a faint monochrome glyph
@@ -92,6 +97,11 @@ class DocToPDFController(NSObject):
             "last_pdf_path": None,
         }
 
+        # Recent exports for the submenu (guarded by _lock; _recent_dirty tells
+        # the UI timer to rebuild the submenu).
+        self._recent: deque = deque(maxlen=RECENT_MAX)
+        self._recent_dirty = True
+
         # --- worker plumbing ----------------------------------------------
         self.creds = None
         self.service = None
@@ -138,9 +148,19 @@ class DocToPDFController(NSObject):
         action("Export now", "onExportNow:")
         action("Open Export", "onOpenPDF:")
         action("Reveal in Finder", "onReveal:")
+
+        # Recent-exports submenu (rebuilt by the UI timer from self._recent).
+        self._recent_menu = NSMenu.alloc().init()
+        self._recent_menu.setAutoenablesItems_(False)
+        self._mi_recent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Recent exports", None, "")
+        self._mi_recent.setSubmenu_(self._recent_menu)
+        menu.addItem_(self._mi_recent)
+
         menu.addItem_(NSMenuItem.separatorItem())
         self._mi_pause = action("Pause", "onTogglePause:")
         action("Set Google Doc…", "onSetDoc:")
+        self._mi_login = action("Launch at Login", "onToggleLogin:")
         menu.addItem_(NSMenuItem.separatorItem())
         action("Quit", "onQuit:")
 
@@ -301,6 +321,7 @@ class DocToPDFController(NSObject):
         # onSetDoc already reset things and queued a fresh forced poll. git/hook
         # problems are NON-fatal: stay "watching" (no ⚠️ menu-bar glyph) and
         # surface them on a dedicated warning line.
+        now = time.strftime("%H:%M:%S")
         with self._lock:
             if self.doc_id != doc_id:
                 self._state["kind"] = "watching"  # clear the transient exporting glyph
@@ -310,9 +331,16 @@ class DocToPDFController(NSObject):
                 kind="watching",
                 error_msg=None,
                 warning=warning,
-                last_export_time=time.strftime("%H:%M:%S"),
+                last_export_time=now,
                 last_pdf_path=str(primary) if primary else None,
             )
+            if primary:
+                self._recent.appendleft({"time": now, "path": str(primary), "name": name})
+                self._recent_dirty = True
+
+        if primary and self._config.get("notify"):
+            fmts = ", ".join(result.get("written", {}).keys()) or "pdf"
+            self._notify(f"{name}", f"Exported {fmts} · {now}")
 
     # ----------------------------------------------------------- UI refresh
     def refreshUI_(self, _timer) -> None:
@@ -355,6 +383,19 @@ class DocToPDFController(NSObject):
             self._mi_warn.setHidden_(False)
         else:
             self._mi_warn.setHidden_(True)
+
+        # "Launch at Login" checkmark reflects whether the LaunchAgent is installed.
+        self._mi_login.setState_(
+            NSControlStateValueOn if launchagent.is_installed() else NSControlStateValueOff
+        )
+
+        # Rebuild the "Recent exports" submenu only when it changed.
+        with self._lock:
+            dirty = self._recent_dirty
+            recent = list(self._recent) if dirty else None
+            self._recent_dirty = False
+        if dirty:
+            self._rebuild_recent_menu(recent)
 
     # ------------------------------------------------------------- actions
     def onSetDoc_(self, _sender) -> None:
@@ -418,6 +459,26 @@ class DocToPDFController(NSObject):
                 self._auth_blocked = False  # resuming counts as a retry
         self._wake.set()
 
+    def onOpenRecent_(self, sender) -> None:
+        path = sender.representedObject()
+        if path and Path(path).exists():
+            subprocess.run(["open", str(path)], check=False)
+        else:
+            self._alert("File missing", "That export no longer exists on disk.")
+
+    def onToggleLogin_(self, _sender) -> None:
+        try:
+            if launchagent.is_installed():
+                launchagent.uninstall()
+            else:
+                launchagent.install()
+                self._alert(
+                    "Launch at Login enabled",
+                    "DocToPDF will start automatically the next time you log in.",
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._alert("Couldn't change Login setting", str(exc))
+
     def onQuit_(self, _sender) -> None:
         self._stop.set()
         self._wake.set()
@@ -442,6 +503,38 @@ class DocToPDFController(NSObject):
         alert.setInformativeText_(message)
         alert.addButtonWithTitle_("OK")
         alert.runModal()
+
+    @objc.python_method
+    def _rebuild_recent_menu(self, recent) -> None:
+        """Rebuild the Recent-exports submenu (main thread, from refreshUI_)."""
+        self._recent_menu.removeAllItems()
+        if not recent:
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "No exports yet", None, "")
+            item.setEnabled_(False)
+            self._recent_menu.addItem_(item)
+            return
+        for entry in recent:  # already newest-first (appendleft)
+            label = f"{entry['time']}   {Path(entry['path']).name}"
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                label, "onOpenRecent:", "")
+            item.setTarget_(self)
+            item.setRepresentedObject_(entry["path"])
+            self._recent_menu.addItem_(item)
+
+    @objc.python_method
+    def _notify(self, title: str, message: str) -> None:
+        """Post a macOS notification (fire-and-forget via osascript)."""
+        def esc(s):
+            return str(s).replace("\\", "\\\\").replace('"', '\\"')
+        script = f'display notification "{esc(message)}" with title "{esc(title)}"'
+        threading.Thread(
+            target=lambda: subprocess.run(
+                ["osascript", "-e", script], check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ),
+            name="doctopdf-notify", daemon=True,
+        ).start()
 
 
 # Module-level strong reference so the controller isn't garbage-collected.
