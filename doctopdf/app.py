@@ -20,7 +20,6 @@ stays responsive during multi-second exports and the interactive auth flow.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import threading
 import time
@@ -41,8 +40,9 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSObject
 
-from . import config, drive
+from . import config, drive, pipeline
 from .drive import AuthFlowError, DriveError, ReauthRequired
+from .pipeline import sanitize_filename  # re-exported for convenience
 
 # Status-item title: a visible text label (easy to find in a crowded menu bar)
 # plus a leading state glyph. Pure emoji renders as a faint monochrome glyph
@@ -55,27 +55,6 @@ GLYPH_PAUSED = "⏸ "
 
 MIN_INTERVAL = 3      # never poll faster than this, whatever the config says
 MAX_INTERVAL = 60     # backoff ceiling
-MAX_NAME_LEN = 200    # filesystem-friendly cap
-
-
-def sanitize_filename(name: str) -> str:
-    """Make a doc name safe to use as a filename on macOS.
-
-    Strips path separators, the historically-awkward ``:``, and control chars,
-    collapses whitespace, and trims leading/trailing dots. Returns ``""`` if
-    nothing usable remains (the caller falls back to the doc id).
-    """
-    if not name:
-        return ""
-    name = name.replace("/", "-").replace(":", "-").replace("\\", "-")
-    name = "".join(ch for ch in name if ord(ch) >= 32)  # drop control chars
-    name = " ".join(name.split())                       # collapse whitespace
-    name = name.strip().strip(".").strip()
-    # A name made only of dots/spaces (e.g. "." or "..") would be a special
-    # directory entry, not a file — reject it so the caller falls back to the id.
-    if not name.strip(". "):
-        return ""
-    return name[:MAX_NAME_LEN]
 
 
 class DocToPDFController(NSObject):
@@ -307,8 +286,9 @@ class DocToPDFController(NSObject):
             return
 
         self._update_state(kind="exporting", error_msg=None)
-        data = drive.export_pdf(self.service, doc_id)
-        path = self._write_pdf(name, doc_id, data)
+        # Export all configured formats, write outputs, and (if configured) commit
+        # to git history and run the post-export hook.
+        result = pipeline.run_export(self._config, self.service, doc_id, name)
 
         # The metadata fetch + export are unlocked network calls; if the user
         # switched docs mid-cycle, don't clobber the new doc's baseline/status
@@ -318,36 +298,16 @@ class DocToPDFController(NSObject):
             if self.doc_id != doc_id:
                 return
             self._last_modified = modified
-        self._update_state(
-            kind="watching",
-            error_msg=None,
-            last_export_time=time.strftime("%H:%M:%S"),
-            last_pdf_path=str(path),
-        )
 
-    @objc.python_method
-    def _write_pdf(self, name: str, doc_id: str, data: bytes) -> Path:
-        out_dir = config.resolve_output_dir(self._config)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        safe = sanitize_filename(name) or doc_id
-        if self._config.get("timestamped"):
-            fname = f"{safe} {time.strftime('%Y-%m-%d %H%M%S')}.pdf"
-        else:
-            fname = f"{safe}.pdf"
-        path = out_dir / fname
-        tmp = out_dir / (fname + ".part")
-        try:
-            with open(tmp, "wb") as fh:
-                fh.write(data)
-            os.replace(tmp, path)  # atomic overwrite — no half-written PDF on Desktop
-        except BaseException:
-            # On any failure (disk full, interrupt) don't leave a .part behind.
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        return path
+        primary = result.get("primary")
+        warning = result.get("warning")
+        self._update_state(
+            # git/hook problems are non-fatal: show the warning but stay watching.
+            kind="error" if warning else "watching",
+            error_msg=warning,
+            last_export_time=time.strftime("%H:%M:%S"),
+            last_pdf_path=str(primary) if primary else None,
+        )
 
     # ----------------------------------------------------------- UI refresh
     def refreshUI_(self, _timer) -> None:

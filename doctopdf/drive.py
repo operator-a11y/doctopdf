@@ -210,15 +210,15 @@ def get_file_metadata(service, file_id: str) -> dict:
     )
 
 
-def export_pdf(service, file_id: str) -> bytes:
-    """Export the Google Doc to PDF bytes.
+def export(service, file_id: str, mime_type: str) -> bytes:
+    """Export the Google Doc to the given MIME type and return the bytes.
 
     Raises :class:`DriveError` on failure. The 10 MB cap is enforced server-side
     (a 403 ``exportSizeLimitExceeded`` raised before any bytes return); the
     ``len`` check below is a defensive backstop only.
     """
     data = _call(
-        lambda: service.files().export(fileId=file_id, mimeType="application/pdf").execute(),
+        lambda: service.files().export(fileId=file_id, mimeType=mime_type).execute(),
         file_id,
     )
     if not isinstance(data, (bytes, bytearray)):
@@ -226,6 +226,11 @@ def export_pdf(service, file_id: str) -> bytes:
     if len(data) > EXPORT_SIZE_LIMIT:
         raise DriveError("Doc is too large to export (>10 MB cap).")
     return bytes(data)
+
+
+def export_pdf(service, file_id: str) -> bytes:
+    """Export the Google Doc to PDF bytes."""
+    return export(service, file_id, "application/pdf")
 
 
 def _http_message(exc: HttpError, file_id: str) -> str:

@@ -36,12 +36,27 @@ SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 DEFAULT_CONFIG: dict[str, Any] = {
     # Google Doc file id to watch (``None`` until the user sets one).
     "doc_id": None,
-    # Where exported PDFs are written. ``~`` is expanded on use.
+    # Where exported files are written. ``~`` is expanded on use.
     "output_dir": "~/Desktop",
     # Poll interval in seconds.
     "poll_interval": 10,
-    # When True, write ``<name> <timestamp>.pdf`` instead of overwriting.
+    # When True, write ``<name> <timestamp>.<ext>`` instead of overwriting.
     "timestamped": False,
+    # Export formats written on each change (see pipeline.EXPORT_FORMATS):
+    # any of pdf, docx, odt, rtf, txt, html, md, epub.
+    "formats": ["pdf"],
+    # Rolling history: if > 0, write timestamped files and keep only the newest N
+    # (per format). 0 disables (overwrite or keep-all per ``timestamped``).
+    "keep_versions": 0,
+    # Git version history: path to a repo dir. On each change the exports are
+    # written there (stable names) and committed. ``None`` disables.
+    "git_repo": None,
+    # When git_repo is set, also export a markdown snapshot so history has real
+    # text diffs (PDFs/docx don't diff).
+    "git_snapshot_text": True,
+    # Shell command run after each export. ``$1`` and $DOCTOPDF_PRIMARY are the
+    # primary file path; $DOCTOPDF_FILES lists all; $DOCTOPDF_DOC_NAME the name.
+    "post_export_cmd": None,
 }
 
 

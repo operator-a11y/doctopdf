@@ -98,11 +98,53 @@ Settings persist to `~/Library/Application Support/DocToPDF/config.json`:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `doc_id` | `null` | The watched Google Doc ID (set via the menu). |
-| `output_dir` | `~/Desktop` | Where PDFs are written. |
+| `output_dir` | `~/Desktop` | Where exported files are written. |
 | `poll_interval` | `10` | Seconds between change checks (min 3). |
-| `timestamped` | `false` | If `true`, write `<DocName> <timestamp>.pdf` (keeps history) instead of overwriting one file. |
+| `timestamped` | `false` | If `true`, write `<DocName> <timestamp>.<ext>` (keeps every version) instead of overwriting. |
+| `formats` | `["pdf"]` | Formats to export each change. Any of `pdf`, `docx`, `odt`, `rtf`, `txt`, `html`, `md`, `epub`. |
+| `keep_versions` | `0` | Rolling history: if `> 0`, write timestamped files and keep only the newest N **per format**. |
+| `git_repo` | `null` | Path to a git repo. On each change the exports are committed there (full version history). |
+| `git_snapshot_text` | `true` | When `git_repo` is set, also commit a `.md` snapshot so history has real text diffs. |
+| `post_export_cmd` | `null` | Shell command run after each export (see below). |
 
 Edit the file while the app is closed, then relaunch to pick up changes.
+
+### Export more
+
+```jsonc
+{
+  "formats": ["pdf", "docx", "md"],   // export several formats at once
+  "keep_versions": 10                 // keep the last 10 timestamped copies per format
+}
+```
+
+### Version history (great for resume iteration)
+
+Point `git_repo` at a folder and every change becomes a git commit with a
+timestamp — a full, recoverable history. Because a markdown snapshot is committed
+alongside, you get **real diffs** (PDFs don't diff, text does):
+
+```jsonc
+{ "formats": ["pdf"], "git_repo": "~/Documents/DocToPDF-history" }
+```
+
+```bash
+cd ~/Documents/DocToPDF-history
+git log --oneline           # every saved revision
+git diff HEAD~5 -- "*.md"   # what changed across the last 5 saves
+```
+
+### Post-export hook (turn it into a platform)
+
+`post_export_cmd` runs after each export. `$1` and `$DOCTOPDF_PRIMARY` are the
+primary file path; `$DOCTOPDF_FILES` lists all written files (newline-separated);
+`$DOCTOPDF_DOC_NAME` is the doc name.
+
+```jsonc
+{ "post_export_cmd": "lpr \"$1\"" }                                 // auto-print
+{ "post_export_cmd": "curl -F file=@\"$1\" https://example.com/up" } // upload/webhook
+{ "post_export_cmd": "cp \"$1\" ~/Dropbox/" }                       // sync elsewhere
+```
 
 ---
 
@@ -154,6 +196,7 @@ launchctl unload ~/Library/LaunchAgents/com.doctopdf.agent.plist
 doctopdf/
   app.py       # native AppKit menu bar: status item, menu, watch loop (worker + UI timer)
   drive.py     # Google auth + Drive get/export helpers
+  pipeline.py  # export pipeline: multi-format, output modes, git history, post-export hook
   config.py    # config load/save + token/config paths
 requirements.txt
 launchd/com.doctopdf.agent.plist
