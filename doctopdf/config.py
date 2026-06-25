@@ -53,8 +53,10 @@ def load_config() -> dict[str, Any]:
             stored = json.load(fh)
         if isinstance(stored, dict):
             config.update({k: stored[k] for k in DEFAULT_CONFIG if k in stored})
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        # Missing or corrupt config — fall back to defaults.
+    except (OSError, ValueError):
+        # Missing, unreadable, non-UTF8, or malformed config — fall back to
+        # defaults. (json.JSONDecodeError and UnicodeDecodeError are both
+        # ValueError; FileNotFoundError/permission errors are OSError.)
         pass
     return config
 
