@@ -300,20 +300,24 @@ def run_export(cfg: dict, service, file_id: str, name: str, gtype: str = "docume
     git_repo = cfg.get("git_repo")
 
     # Decide every format we must export: the requested outputs, plus a text
-    # format (valid for this type) for the git snapshot so history has real diffs.
+    # format (valid for this type) for the git snapshot / AI summary so history
+    # and summaries have real text to diff.
+    want_text = (git_repo and cfg.get("git_snapshot_text", True)) or cfg.get("ai_summary")
     needed = list(formats)
-    if git_repo and cfg.get("git_snapshot_text", True):
-        if not any(f in TEXT_FORMATS for f in needed):
-            # Prefer by TEXT_FORMATS order (md for Docs, csv for Sheets, …),
-            # not the type table's order.
-            snap = next((f for f in TEXT_FORMATS if f in table), None)
-            if snap:
-                needed.append(snap)
+    if want_text and not any(f in TEXT_FORMATS for f in needed):
+        # Prefer by TEXT_FORMATS order (md for Docs, csv for Sheets, …).
+        snap = next((f for f in TEXT_FORMATS if f in table), None)
+        if snap:
+            needed.append(snap)
 
     blobs: dict[str, tuple[str, bytes]] = {}
     for fmt in needed:
         mime, ext = table[fmt]
         blobs[fmt] = (ext, drive.export(service, file_id, mime))
+
+    # Plain-text form of the doc (first text format exported), for AI summaries.
+    text_fmt = next((f for f in needed if f in TEXT_FORMATS), None)
+    text = blobs[text_fmt][1].decode("utf-8", "replace") if text_fmt else None
 
     written: dict[str, Path] = {}
     for fmt in formats:
@@ -338,4 +342,5 @@ def run_export(cfg: dict, service, file_id: str, name: str, gtype: str = "docume
         except Exception as exc:  # noqa: BLE001 — couldn't even launch the hook
             warning = warning or f"Post-export hook couldn't start: {exc}"
 
-    return {"primary": primary, "written": written, "commit": commit, "warning": warning}
+    return {"primary": primary, "written": written, "commit": commit,
+            "warning": warning, "text": text}

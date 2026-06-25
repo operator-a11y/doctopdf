@@ -63,6 +63,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "post_export_cmd": None,
     # Post a macOS notification on each export.
     "notify": False,
+    # AI change summaries via a LOCAL model (no cloud key). On each change, diff
+    # the doc's text and have the local model summarize it as a notification.
+    "ai_summary": False,
+    "ollama_url": "http://localhost:11434",
+    "ollama_model": "llama3",
 }
 
 

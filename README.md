@@ -7,7 +7,8 @@ seconds a fresh `~/Desktop/<Name>.pdf` (and any other formats you pick) appears.
 
 Also: **multi-format export** (pdf/docx/xlsx/pptx/md/…), **git version history**
 with text diffs, **rolling versions**, a **post-export shell hook**, macOS
-**notifications**, and **launch-at-login**.
+**notifications**, **launch-at-login**, and **AI change summaries** via a local
+model (no cloud key).
 
 ```
 DocToPDF
@@ -117,6 +118,9 @@ Settings persist to `~/Library/Application Support/DocToPDF/config.json`:
 | `git_snapshot_text` | `true` | When `git_repo` is set, also commit a text snapshot (md/csv/…) so history has real diffs. |
 | `post_export_cmd` | `null` | Shell command run after each export (see below). |
 | `notify` | `false` | Post a macOS notification on each export. |
+| `ai_summary` | `false` | On each change, summarize the edit with a **local** model (see below). |
+| `ollama_url` | `http://localhost:11434` | Local Ollama server URL. |
+| `ollama_model` | `"llama3"` | Local model to use for summaries. |
 
 > `doc_id` (a legacy single-doc id) is auto-migrated into `watch` on first launch.
 
@@ -178,6 +182,26 @@ primary file path; `$DOCTOPDF_FILES` lists all written files (newline-separated)
 { "post_export_cmd": "cp \"$1\" ~/Dropbox/" }                       // sync elsewhere
 ```
 
+### AI change summaries (local model — no cloud key)
+
+With `"ai_summary": true`, each change is diffed and summarized by a **local
+model** and posted as a notification — e.g. *"Updated job title from engineer to
+senior engineer."* No data leaves your machine; nothing is sent to any cloud API.
+
+Requires [Ollama](https://ollama.com) running locally with a model pulled:
+
+```bash
+brew install ollama && ollama serve      # if not already running
+ollama pull llama3                        # or any model; set "ollama_model"
+```
+
+```jsonc
+{ "ai_summary": true, "ollama_model": "llama3" }
+```
+
+If no local model is reachable, summaries are silently skipped — watching is
+never affected. Runs asynchronously, so a slow model never delays exports.
+
 ---
 
 ## Behavior & limits
@@ -230,6 +254,7 @@ doctopdf/
   app.py         # native AppKit menu bar: status item, menu, multi-target watch loop
   drive.py       # Google auth + Drive get/list/export helpers
   pipeline.py    # export pipeline: type-aware formats, output modes, git history, hook
+  summarize.py   # local-model (Ollama) AI change summaries
   launchagent.py # install/remove the launch-at-login LaunchAgent
   config.py      # config load/save + token/config paths
 requirements.txt

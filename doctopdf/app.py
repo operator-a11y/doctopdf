@@ -43,7 +43,7 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSObject
 
-from . import config, drive, launchagent, pipeline
+from . import config, drive, launchagent, pipeline, summarize
 from .drive import AuthFlowError, DriveError, ReauthRequired
 from .pipeline import sanitize_filename  # re-exported for convenience
 
@@ -93,6 +93,7 @@ class DocToPDFController(NSObject):
             self._config["watch"] = self._watch
             config.save_config(self._config)
         self._modified: dict = {}           # file id -> last seen Drive modifiedTime
+        self._prev_text: dict = {}          # file id -> last exported text (for AI diffs)
         self._entry_names: dict = {}        # watch-entry id -> menu label
         self._watch_sig = None              # last-rendered watch submenu signature
         self._interval = self._base_interval
@@ -403,6 +404,7 @@ class DocToPDFController(NSObject):
             # force a redundant re-export next time.
             if completed and not notes:
                 self._modified = {k: v for k, v in self._modified.items() if k in live}
+                self._prev_text = {k: v for k, v in self._prev_text.items() if k in live}
             # Only publish batch status on a completed (non-paused) cycle, so a
             # mid-batch pause doesn't leave a partial count/warning.
             if completed:
@@ -442,7 +444,24 @@ class DocToPDFController(NSObject):
         if primary and self._config.get("notify"):
             fmts = ", ".join(result.get("written", {}).keys()) or "pdf"
             self._notify(f"{name}", f"Exported {fmts} · {now}")
+
+        # AI change summary via a local model (async; never blocks the watch loop).
+        if cfg.get("ai_summary"):
+            new_text = result.get("text")
+            old_text = self._prev_text.get(fid)
+            if new_text is not None:
+                self._prev_text[fid] = new_text
+            if new_text and old_text and old_text != new_text:
+                self._summarize(name, old_text, new_text, cfg)
         return result.get("warning")
+
+    @objc.python_method
+    def _summarize(self, name, old_text, new_text, cfg) -> None:
+        def go():
+            s = summarize.summarize_change(old_text, new_text, cfg)
+            if s:
+                self._notify(f"{name} — changed", s)
+        threading.Thread(target=go, name="doctopdf-ai", daemon=True).start()
 
     # ----------------------------------------------------------- UI refresh
     def refreshUI_(self, _timer) -> None:
