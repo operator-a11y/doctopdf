@@ -9,7 +9,9 @@ thread. It never touches AppKit. ``run_export`` is the single entry point.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -58,6 +60,8 @@ def resolve_formats(cfg: dict) -> list[str]:
     raw = cfg.get("formats") or ["pdf"]
     if isinstance(raw, str):
         raw = [raw]
+    elif not isinstance(raw, (list, tuple)):
+        raw = []  # malformed config (e.g. a number) → fall back to default
     seen, out = set(), []
     for f in raw:
         f = str(f).lower().lstrip(".")
@@ -97,23 +101,38 @@ def write_output(out_dir: Path, base: str, ext: str, data: bytes,
     out_dir.mkdir(parents=True, exist_ok=True)
     rolling = keep_n > 0
     if timestamped or rolling:
-        fname = f"{base} {time.strftime('%Y-%m-%d %H%M%S')}.{ext}"
+        stamp = time.strftime("%Y-%m-%d %H%M%S")
+        path = out_dir / f"{base} {stamp}.{ext}"
+        # Two exports in the same wall-clock second would otherwise overwrite each
+        # other — disambiguate with a counter so no version is lost.
+        n = 2
+        while path.exists():
+            path = out_dir / f"{base} {stamp}-{n}.{ext}"
+            n += 1
     else:
-        fname = f"{base}.{ext}"
-    path = out_dir / fname
+        path = out_dir / f"{base}.{ext}"
     _atomic_write(path, data)
     if rolling:
         _prune_versions(out_dir, base, ext, keep_n)
     return path
 
 
+def _version_pattern(base: str, ext: str) -> "re.Pattern[str]":
+    """Match exactly this base/ext's timestamped versions: ``<base> <ts>[-N].<ext>``.
+
+    Anchored so a different doc whose name merely *starts with* ``base`` (e.g.
+    'Report Q3' vs 'Report') is never matched — which would otherwise let one
+    doc's prune silently delete another doc's version history.
+    """
+    return re.compile(
+        rf"^{re.escape(base)} \d{{4}}-\d{{2}}-\d{{2}} \d{{6}}(?:-\d+)?\.{re.escape(ext)}$"
+    )
+
+
 def _prune_versions(out_dir: Path, base: str, ext: str, keep_n: int) -> None:
-    prefix, suffix = f"{base} ", f".{ext}"
+    pattern = _version_pattern(base, ext)
     try:
-        versions = [
-            p for p in out_dir.iterdir()
-            if p.name.startswith(prefix) and p.name.endswith(suffix)
-        ]
+        versions = [p for p in out_dir.iterdir() if pattern.match(p.name)]
     except OSError:
         return
     versions.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -148,19 +167,22 @@ def commit_history(repo_dir: Path, doc_name: str, files: dict[str, bytes]) -> Op
     if not (repo / ".git").is_dir():
         _git(repo, "init", "-q")
 
+    names = list(files)
     for fname, data in files.items():
         _atomic_write(repo / fname, data)
 
-    _git(repo, "add", "-A")
-    # Nothing staged → nothing to commit (identical content); not an error.
-    if not _git(repo, "status", "--porcelain").stdout.strip():
-        return None
+    # Scope every operation to ONLY our snapshot files, so a shared/existing repo
+    # (or a git_repo that contains the output dir) never sweeps unrelated files
+    # into our commits and our "nothing changed" check stays accurate.
+    _git(repo, "add", "--", *names)
+    if _git(repo, "diff", "--cached", "--quiet", "--", *names, check=False).returncode == 0:
+        return None  # our files are unchanged — not an error, just no new version
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     _git(
         repo,
         "-c", "user.name=DocToPDF",
         "-c", "user.email=doctopdf@localhost",
-        "commit", "-q", "-m", f"{doc_name} — {ts}",
+        "commit", "-q", "-m", f"{doc_name} — {ts}", "--", *names,
     )
     return _git(repo, "rev-parse", "--short", "HEAD", check=False).stdout.strip() or None
 
@@ -171,18 +193,32 @@ def commit_history(repo_dir: Path, doc_name: str, files: dict[str, bytes]) -> Op
 
 
 def run_hook(cmd: str, primary: Optional[Path], doc_name: str, files: list[Path]) -> None:
-    """Run the user's post-export command. ``$1`` is the primary file path; also
-    exposes DOCTOPDF_PRIMARY / DOCTOPDF_DOC_NAME / DOCTOPDF_FILES in the env."""
+    """Run the user's post-export command **fire-and-forget** on a daemon thread.
+
+    ``$1`` and ``$DOCTOPDF_PRIMARY`` are the primary file path; ``$DOCTOPDF_FILES``
+    lists all written files; ``$DOCTOPDF_DOC_NAME`` is the doc name. The command
+    runs detached from the watch loop (with stdio to /dev/null and a hard
+    timeout), so a slow or hanging hook never stalls polling.
+    """
     primary_s = str(primary) if primary else ""
     env = os.environ.copy()
     env["DOCTOPDF_DOC_NAME"] = doc_name or ""
     env["DOCTOPDF_PRIMARY"] = primary_s
     env["DOCTOPDF_FILES"] = "\n".join(str(p) for p in files)
-    subprocess.run(
-        ["/bin/sh", "-c", cmd, "doctopdf", primary_s],
-        env=env, check=False, timeout=HOOK_TIMEOUT,
-        capture_output=True, text=True,
-    )
+
+    def _run() -> None:
+        try:
+            subprocess.run(
+                ["/bin/sh", "-c", cmd, "doctopdf", primary_s],
+                env=env, check=False, timeout=HOOK_TIMEOUT,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:  # noqa: BLE001 — fire-and-forget; never affect watching
+            pass
+
+    threading.Thread(target=_run, name="doctopdf-hook", daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -239,8 +275,8 @@ def run_export(cfg: dict, service, file_id: str, name: str) -> dict:
     cmd = cfg.get("post_export_cmd")
     if cmd:
         try:
-            run_hook(cmd, primary, name, list(written.values()))
-        except Exception as exc:  # noqa: BLE001 — hook is best-effort
-            warning = warning or f"Post-export hook failed: {exc}"
+            run_hook(cmd, primary, name, list(written.values()))  # fire-and-forget
+        except Exception as exc:  # noqa: BLE001 — couldn't even launch the hook
+            warning = warning or f"Post-export hook couldn't start: {exc}"
 
     return {"primary": primary, "written": written, "commit": commit, "warning": warning}

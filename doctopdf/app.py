@@ -87,7 +87,8 @@ class DocToPDFController(NSObject):
             "kind": "starting",             # starting|authorizing|watching|exporting|error|needs_doc|paused
             "doc_name": None,
             "last_export_time": None,
-            "error_msg": None,
+            "error_msg": None,              # fatal: shown with the ⚠️ menu-bar glyph
+            "warning": None,                # non-fatal (git/hook): export still succeeded
             "last_pdf_path": None,
         }
 
@@ -131,9 +132,11 @@ class DocToPDFController(NSObject):
 
         self._mi_status = disabled("Starting…")
         self._mi_last = disabled("Last export: —")
+        self._mi_warn = disabled("")        # non-fatal warning line, hidden unless set
+        self._mi_warn.setHidden_(True)
         menu.addItem_(NSMenuItem.separatorItem())
         action("Export now", "onExportNow:")
-        action("Open PDF", "onOpenPDF:")
+        action("Open Export", "onOpenPDF:")
         action("Reveal in Finder", "onReveal:")
         menu.addItem_(NSMenuItem.separatorItem())
         self._mi_pause = action("Pause", "onTogglePause:")
@@ -290,24 +293,26 @@ class DocToPDFController(NSObject):
         # to git history and run the post-export hook.
         result = pipeline.run_export(self._config, self.service, doc_id, name)
 
-        # The metadata fetch + export are unlocked network calls; if the user
-        # switched docs mid-cycle, don't clobber the new doc's baseline/status
-        # with this (now-stale) result. onSetDoc already reset things under the
-        # lock and queued a fresh forced poll.
-        with self._lock:
-            if self.doc_id != doc_id:
-                return
-            self._last_modified = modified
-
         primary = result.get("primary")
         warning = result.get("warning")
-        self._update_state(
-            # git/hook problems are non-fatal: show the warning but stay watching.
-            kind="error" if warning else "watching",
-            error_msg=warning,
-            last_export_time=time.strftime("%H:%M:%S"),
-            last_pdf_path=str(primary) if primary else None,
-        )
+        # Publish baseline + status atomically. The metadata fetch + export are
+        # unlocked network calls; if the user switched docs mid-cycle, don't
+        # clobber the new doc's baseline/status with this (now-stale) result —
+        # onSetDoc already reset things and queued a fresh forced poll. git/hook
+        # problems are NON-fatal: stay "watching" (no ⚠️ menu-bar glyph) and
+        # surface them on a dedicated warning line.
+        with self._lock:
+            if self.doc_id != doc_id:
+                self._state["kind"] = "watching"  # clear the transient exporting glyph
+                return
+            self._last_modified = modified
+            self._state.update(
+                kind="watching",
+                error_msg=None,
+                warning=warning,
+                last_export_time=time.strftime("%H:%M:%S"),
+                last_pdf_path=str(primary) if primary else None,
+            )
 
     # ----------------------------------------------------------- UI refresh
     def refreshUI_(self, _timer) -> None:
@@ -342,6 +347,14 @@ class DocToPDFController(NSObject):
         last = st["last_export_time"]
         self._mi_last.setTitle_(f"Last export: {last}" if last else "Last export: —")
         self._mi_pause.setTitle_("Resume" if paused else "Pause")
+
+        # Non-fatal git/hook warning: shown on its own line, not as the error glyph.
+        warn = st.get("warning")
+        if warn:
+            self._mi_warn.setTitle_(f"⚠️ {warn}")
+            self._mi_warn.setHidden_(False)
+        else:
+            self._mi_warn.setHidden_(True)
 
     # ------------------------------------------------------------- actions
     def onSetDoc_(self, _sender) -> None:
@@ -389,14 +402,14 @@ class DocToPDFController(NSObject):
         if path and path.exists():
             subprocess.run(["open", str(path)], check=False)
         else:
-            self._alert("No PDF yet", "Nothing has been exported yet.")
+            self._alert("No export yet", "Nothing has been exported yet.")
 
     def onReveal_(self, _sender) -> None:
         path = self._current_pdf_path()
         if path and path.exists():
             subprocess.run(["open", "-R", str(path)], check=False)
         else:
-            self._alert("No PDF yet", "Nothing has been exported yet.")
+            self._alert("No export yet", "Nothing has been exported yet.")
 
     def onTogglePause_(self, _sender) -> None:
         with self._lock:
