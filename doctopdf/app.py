@@ -312,56 +312,80 @@ class DocToPDFController(NSObject):
             return False
 
     @objc.python_method
-    def _resolve_targets(self, watch: list) -> list:
-        """Expand the watch list into concrete file targets (folders → children).
+    def _resolve_targets(self, watch: list):
+        """Expand the watch list into concrete file targets (folders → their
+        direct children, non-recursive). Returns ``(targets, errors)``.
 
-        Each target is ``{id, name, modified, gtype, overrides}``. Raises
-        DriveError/ReauthRequired on auth/network failure (handled by the worker);
-        a single bad/non-exportable entry is skipped, not fatal.
+        Each target is ``{id, name, modified, gtype, overrides}``. A single bad
+        entry (deleted/unshared/network) is caught and reported, never aborting
+        the others; ReauthRequired bubbles up so the worker can re-auth. Targets
+        are de-duplicated by id, and colliding display names are disambiguated.
         """
-        targets, entry_names = [], {}
+        targets, entry_names, errors, seen = [], {}, [], set()
+
+        def add(fid, name, modified, gtype, overrides):
+            if fid in seen:
+                return
+            seen.add(fid)
+            targets.append({"id": fid, "name": name or fid, "modified": modified,
+                            "gtype": gtype, "overrides": overrides})
+
         for entry in watch:
             fid = entry.get("id")
             if not fid:
                 continue
             overrides = {k: entry[k] for k in ("output_dir", "formats") if k in entry}
-            meta = drive.get_file_metadata(self.service, fid)
-            drive.maybe_persist_refreshed_token(self.creds)
-            gtype = pipeline.google_type(meta.get("mimeType"))
-            label = meta.get("name") or fid
-            if gtype == "folder":
-                n = 0
-                for child in drive.list_folder(self.service, fid):
-                    cgt = pipeline.google_type(child.get("mimeType"))
-                    if cgt in pipeline.FORMATS_BY_TYPE:
-                        targets.append({
-                            "id": child["id"], "name": child.get("name") or child["id"],
-                            "modified": child.get("modifiedTime"), "gtype": cgt,
-                            "overrides": overrides,
-                        })
-                        n += 1
-                entry_names[fid] = f"📁 {label} ({n})"
-            elif gtype in pipeline.FORMATS_BY_TYPE:
-                targets.append({
-                    "id": fid, "name": label, "modified": meta.get("modifiedTime"),
-                    "gtype": gtype, "overrides": overrides,
-                })
-                entry_names[fid] = label
-            else:
-                entry_names[fid] = f"{label} (unsupported)"
+            try:
+                meta = drive.get_file_metadata(self.service, fid)
+                drive.maybe_persist_refreshed_token(self.creds)
+                gtype = pipeline.google_type(meta.get("mimeType"))
+                label = meta.get("name") or fid
+                if gtype == "folder":
+                    n = 0
+                    for child in drive.list_folder(self.service, fid):
+                        cgt = pipeline.google_type(child.get("mimeType"))
+                        if cgt in pipeline.FORMATS_BY_TYPE:
+                            add(child["id"], child.get("name"), child.get("modifiedTime"),
+                                cgt, overrides)
+                            n += 1
+                    entry_names[fid] = f"📁 {label} ({n})"
+                elif gtype in pipeline.FORMATS_BY_TYPE:
+                    add(fid, label, meta.get("modifiedTime"), gtype, overrides)
+                    entry_names[fid] = label
+                else:
+                    entry_names[fid] = f"{label} (unsupported)"
+            except ReauthRequired:
+                raise
+            except DriveError as exc:
+                entry_names[fid] = f"⚠️ {fid[:8]}…: {exc}"
+                errors.append(f"{fid[:8]}…: {exc}")
+
+        # Disambiguate distinct files that share a name (e.g. two "Untitled
+        # document"s) so their outputs/versions/commits never collide.
+        counts = {}
+        for t in targets:
+            base = pipeline.sanitize_filename(t["name"]) or t["id"]
+            counts[base] = counts.get(base, 0) + 1
+        for t in targets:
+            base = pipeline.sanitize_filename(t["name"]) or t["id"]
+            if counts[base] > 1:
+                t["name"] = f"{t['name']} ({t['id'][:6]})"
+
         with self._lock:
             self._entry_names = entry_names
-        return targets
+        return targets, errors
 
     @objc.python_method
     def _poll_all(self, watch: list, force: bool) -> None:
-        targets = self._resolve_targets(watch)
-        notes = []  # per-file DriveErrors + git/hook warnings
+        targets, errors = self._resolve_targets(watch)
+        notes = list(errors)  # resolve errors + per-file export errors + git/hook warnings
+        completed = True
         for t in targets:
             if self._stop.is_set():
                 return
             with self._lock:
                 if self._paused:
+                    completed = False
                     break
             try:
                 warning = self._poll_file(t, force)
@@ -372,18 +396,26 @@ class DocToPDFController(NSObject):
             except DriveError as exc:
                 notes.append(f"{t['name']}: {exc}")
 
-        # Publish batch status; clears stale warnings on a fully clean cycle.
+        live = {t["id"] for t in targets}
         with self._lock:
-            self._state["kind"] = "watching"
-            self._state["error_msg"] = None
-            self._state["watch_count"] = len(targets)
-            self._state["names"] = [t["name"] for t in targets]
-            if not notes:
-                self._state["warning"] = None
-            elif len(notes) == 1:
-                self._state["warning"] = notes[0]
-            else:
-                self._state["warning"] = f"{len(notes)} issues (e.g. {notes[0]})"
+            # Bound _modified to currently-resolved targets, but only on a fully
+            # clean cycle so a transient failure doesn't drop a baseline and
+            # force a redundant re-export next time.
+            if completed and not notes:
+                self._modified = {k: v for k, v in self._modified.items() if k in live}
+            # Only publish batch status on a completed (non-paused) cycle, so a
+            # mid-batch pause doesn't leave a partial count/warning.
+            if completed:
+                self._state["kind"] = "watching"
+                self._state["error_msg"] = None
+                self._state["watch_count"] = len(targets)
+                self._state["names"] = [t["name"] for t in targets]
+                if not notes:
+                    self._state["warning"] = None
+                elif len(notes) == 1:
+                    self._state["warning"] = notes[0]
+                else:
+                    self._state["warning"] = f"{len(notes)} issues (e.g. {notes[0]})"
 
     @objc.python_method
     def _poll_file(self, t: dict, force: bool):

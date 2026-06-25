@@ -123,9 +123,10 @@ Settings persist to `~/Library/Application Support/DocToPDF/config.json`:
 ### Watch many docs, folders, and Sheets/Slides
 
 Add docs/sheets/slides/folders via **Add Doc or Folder…** — or edit `watch`
-directly. A folder mirrors every exportable Google file inside it. `formats` may
-list formats for several types at once; each file keeps only the ones valid for
-its type, so one list "just works":
+directly. A folder mirrors every exportable Google file **directly inside it**
+(non-recursive; subfolders aren't descended). `formats` may list formats for
+several types at once; each file keeps only the ones valid for its type, so one
+list "just works":
 
 ```jsonc
 {

@@ -304,7 +304,9 @@ def run_export(cfg: dict, service, file_id: str, name: str, gtype: str = "docume
     needed = list(formats)
     if git_repo and cfg.get("git_snapshot_text", True):
         if not any(f in TEXT_FORMATS for f in needed):
-            snap = next((f for f in table if f in TEXT_FORMATS), None)
+            # Prefer by TEXT_FORMATS order (md for Docs, csv for Sheets, …),
+            # not the type table's order.
+            snap = next((f for f in TEXT_FORMATS if f in table), None)
             if snap:
                 needed.append(snap)
 

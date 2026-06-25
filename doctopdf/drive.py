@@ -22,9 +22,12 @@ from . import config
 # A Google Docs export to PDF is capped by the Drive API at 10 MB.
 EXPORT_SIZE_LIMIT = 10 * 1024 * 1024
 
-# Matches the file id in a typical Doc URL, e.g.
+# Matches the file/folder id in a Google URL, e.g.
 #   https://docs.google.com/document/d/<ID>/edit
-_URL_ID_RE = re.compile(r"/d/([a-zA-Z0-9_-]+)")
+#   https://drive.google.com/drive/folders/<ID>
+_URL_ID_RE = re.compile(r"/(?:d|folders)/([a-zA-Z0-9_-]+)")
+# The id=… query form, e.g. https://drive.google.com/open?id=<ID>
+_QUERY_ID_RE = re.compile(r"[?&]id=([a-zA-Z0-9_-]+)")
 # A bare id is a run of URL-safe id characters.
 _BARE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{10,}$")
 
@@ -52,16 +55,16 @@ class ReauthRequired(DriveError):
 
 
 def parse_doc_id(text: str) -> Optional[str]:
-    """Extract a Google Doc id from a URL or accept a bare id.
-
-    Returns ``None`` if nothing id-shaped can be found.
+    """Extract a Google file/folder id from a Doc/Sheet/Slides/Drive URL, the
+    ``open?id=`` form, or accept a bare id. Returns ``None`` if none found.
     """
     if not text:
         return None
     text = text.strip()
-    match = _URL_ID_RE.search(text)
-    if match:
-        return match.group(1)
+    for regex in (_URL_ID_RE, _QUERY_ID_RE):
+        match = regex.search(text)
+        if match:
+            return match.group(1)
     if _BARE_ID_RE.match(text):
         return text
     return None
