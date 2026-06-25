@@ -1,0 +1,13 @@
+# Google OAuth secrets — never commit these
+client_secret.json
+token.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# macOS
+.DS_Store
