@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Optional
+from typing import Callable, Optional
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -40,6 +41,16 @@ class AuthFlowError(DriveError):
     """
 
 
+class ReauthRequired(DriveError):
+    """Credentials went stale mid-session (refresh failed / HTTP 401).
+
+    Signals the app to drop the built service and re-run auth on the next cycle —
+    a silent refresh if possible, otherwise a fresh interactive flow. Without
+    this, the transport's failed auto-refresh would loop forever behind an
+    already-built service object.
+    """
+
+
 def parse_doc_id(text: str) -> Optional[str]:
     """Extract a Google Doc id from a URL or accept a bare id.
 
@@ -62,19 +73,32 @@ def parse_doc_id(text: str) -> Optional[str]:
 
 
 def _save_token(creds: Credentials) -> None:
-    """Write credentials to ``token.json`` with 0600 perms."""
-    # Create with restrictive perms from the start to avoid a brief world-readable
-    # window between write and chmod.
-    fd = os.open(config.TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Atomically write credentials to ``token.json`` with 0600 perms.
+
+    Writes to a fresh, exclusively-created temp file (mode 0600 from birth) and
+    ``os.replace`` it into place. The destination inherits the temp file's tight
+    perms, so there is never a world-readable window — even when overwriting a
+    pre-existing token that had looser perms.
+    """
+    tmp = config.TOKEN_PATH.with_name(config.TOKEN_PATH.name + ".tmp")
+    # O_EXCL: never reuse a leftover temp with unknown perms.
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(creds.to_json())
-    finally:
-        # Ensure perms even if the file pre-existed with looser perms.
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, config.TOKEN_PATH)
+    except BaseException:
         try:
-            os.chmod(config.TOKEN_PATH, 0o600)
+            os.unlink(tmp)
         except OSError:
             pass
+        raise
 
 
 def get_credentials() -> Credentials:
@@ -152,31 +176,51 @@ def build_service(creds: Credentials):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def get_file_metadata(service, file_id: str) -> dict:
-    """Return ``{id, name, modifiedTime, mimeType}`` for the file.
+def _call(fn: Callable, file_id: str):
+    """Execute a Drive API request, mapping every failure to a clean exception.
 
-    Raises :class:`DriveError` with a friendly message on HTTP errors.
+    - A failed token refresh (revoked/expired refresh token) or an HTTP 401
+      becomes :class:`ReauthRequired` so the app can re-authorize and recover.
+    - Other HTTP errors become a :class:`DriveError` with a short menu message.
+    - Transport/network failures (timeouts, DNS, TLS, broken pipe) become a
+      retryable ``DriveError`` instead of an opaque ``Unexpected: …``.
     """
     try:
-        return (
-            service.files()
-            .get(fileId=file_id, fields="id, name, modifiedTime, mimeType")
-            .execute()
-        )
+        return fn()
+    except RefreshError as exc:
+        raise ReauthRequired("Re-authorizing…") from exc
     except HttpError as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status == 401:
+            raise ReauthRequired("Re-authorizing…") from exc
         raise DriveError(_http_message(exc, file_id)) from exc
+    except DriveError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — socket/ssl/httplib2/etc. are retryable
+        raise DriveError("Network error — will retry.") from exc
+
+
+def get_file_metadata(service, file_id: str) -> dict:
+    """Return ``{id, name, modifiedTime, mimeType}`` for the file."""
+    return _call(
+        lambda: service.files()
+        .get(fileId=file_id, fields="id, name, modifiedTime, mimeType")
+        .execute(),
+        file_id,
+    )
 
 
 def export_pdf(service, file_id: str) -> bytes:
     """Export the Google Doc to PDF bytes.
 
-    Raises :class:`DriveError` on HTTP errors (including the 10 MB export cap).
+    Raises :class:`DriveError` on failure. The 10 MB cap is enforced server-side
+    (a 403 ``exportSizeLimitExceeded`` raised before any bytes return); the
+    ``len`` check below is a defensive backstop only.
     """
-    try:
-        data = service.files().export(fileId=file_id, mimeType="application/pdf").execute()
-    except HttpError as exc:
-        raise DriveError(_http_message(exc, file_id)) from exc
-
+    data = _call(
+        lambda: service.files().export(fileId=file_id, mimeType="application/pdf").execute(),
+        file_id,
+    )
     if not isinstance(data, (bytes, bytearray)):
         raise DriveError("Export returned no data.")
     if len(data) > EXPORT_SIZE_LIMIT:

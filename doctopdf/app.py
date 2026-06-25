@@ -21,7 +21,7 @@ from pathlib import Path
 import rumps
 
 from . import config, drive
-from .drive import AuthFlowError, DriveError
+from .drive import AuthFlowError, DriveError, ReauthRequired
 
 # Status-item titles per state.
 ICON_IDLE = "📄"
@@ -47,6 +47,10 @@ def sanitize_filename(name: str) -> str:
     name = "".join(ch for ch in name if ord(ch) >= 32)  # drop control chars
     name = " ".join(name.split())                       # collapse whitespace
     name = name.strip().strip(".").strip()
+    # A name made only of dots/spaces (e.g. "." or "..") would be a special
+    # directory entry, not a file — reject it so the caller falls back to the id.
+    if not name.strip(". "):
+        return ""
     return name[:MAX_NAME_LEN]
 
 
@@ -130,7 +134,10 @@ class DocToPDFApp(rumps.App):
 
     def _backoff(self) -> None:
         with self._lock:
-            self._interval = min(MAX_INTERVAL, max(self._base_interval, self._interval) * 2)
+            # Ceiling is at least the configured interval, so a base poll interval
+            # set above MAX_INTERVAL never gets *sped up* by backoff.
+            ceiling = max(MAX_INTERVAL, self._base_interval)
+            self._interval = min(ceiling, max(self._base_interval, self._interval) * 2)
 
     def _sleep_or_wake(self, timeout: float) -> None:
         if self._wake.wait(timeout):
@@ -142,35 +149,48 @@ class DocToPDFApp(rumps.App):
             with self._lock:
                 paused = self._paused
                 doc_id = self.doc_id
-                force = self._force
-                self._force = False
                 blocked = self._auth_blocked
                 interval = self._interval
-
-            if paused:
-                self._update_state(kind="paused")
-                self._sleep_or_wake(1.0)
-                continue
+                force_pending = self._force      # peeked, NOT consumed yet
 
             # Authorize as early as possible (independent of whether a doc is set),
             # so the app prompts on first launch and sits ready in the menu bar.
-            if self.service is None:
+            # Skip auth only when idle-paused with nothing explicitly queued, so we
+            # don't pop a browser while the user has it paused.
+            if self.service is None and not (paused and not force_pending):
                 if blocked:
+                    if paused:
+                        self._update_state(kind="paused")
                     self._sleep_or_wake(interval)
                     continue
                 if not config.CLIENT_SECRET_PATH.exists():
                     self._set_error("Missing client_secret.json — see README.")
                     self._sleep_or_wake(max(interval, 10))
                     continue
-                if not self._authorize():       # sets state/flags on failure
+                if not self._authorize():        # sets state/flags on failure
                     self._sleep_or_wake(interval)
                     continue
-                force = True                    # fresh auth → export immediately
+                with self._lock:
+                    self._force = True           # fresh auth → export immediately
+                    force_pending = True
+
+            # Paused with nothing forced: idle. A queued "Export now" still runs
+            # one export below, without changing the paused state.
+            if paused and not force_pending:
+                self._update_state(kind="paused")
+                self._sleep_or_wake(1.0)
+                continue
 
             if not doc_id:
                 self._update_state(kind="needs_doc")
                 self._sleep_or_wake(max(interval, 2))
                 continue
+
+            # Consume the force flag only now that we will actually poll — so a
+            # request made while paused / unauthorized / doc-less is never lost.
+            with self._lock:
+                force = self._force
+                self._force = False
 
             try:
                 self._poll_once(doc_id, force)
@@ -178,6 +198,12 @@ class DocToPDFApp(rumps.App):
             except AuthFlowError as exc:
                 with self._lock:
                     self._auth_blocked = True
+                self._set_error(str(exc))
+            except ReauthRequired as exc:
+                # Credentials went stale mid-session. Drop the service so the next
+                # cycle re-runs auth (silent refresh, or interactive on failure).
+                self.service = None
+                self.creds = None
                 self._set_error(str(exc))
             except DriveError as exc:
                 self._set_error(str(exc))
@@ -188,6 +214,8 @@ class DocToPDFApp(rumps.App):
 
             with self._lock:
                 interval = self._interval
+                if self._paused:
+                    self._update_state(kind="paused")
             self._sleep_or_wake(interval)
 
     def _authorize(self) -> bool:
@@ -230,7 +258,14 @@ class DocToPDFApp(rumps.App):
         data = drive.export_pdf(self.service, doc_id)
         path = self._write_pdf(name, doc_id, data)
 
-        self._last_modified = modified
+        # The metadata fetch + export are unlocked network calls; if the user
+        # switched docs mid-cycle, don't clobber the new doc's baseline/status
+        # with this (now-stale) result. on_set_doc already reset things under
+        # the lock and queued a fresh forced poll.
+        with self._lock:
+            if self.doc_id != doc_id:
+                return
+            self._last_modified = modified
         self._update_state(
             kind="watching",
             error_msg=None,
@@ -248,9 +283,17 @@ class DocToPDFApp(rumps.App):
             fname = f"{safe}.pdf"
         path = out_dir / fname
         tmp = out_dir / (fname + ".part")
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp, path)  # atomic overwrite — no half-written PDF on Desktop
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, path)  # atomic overwrite — no half-written PDF on Desktop
+        except BaseException:
+            # On any failure (disk full, interrupt) don't leave a .part behind.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         return path
 
     # ----------------------------------------------------------- UI refresh
@@ -351,7 +394,10 @@ class DocToPDFApp(rumps.App):
     def on_quit(self, _sender) -> None:
         self._stop.set()
         self._wake.set()
-        self._worker.join(timeout=2.0)
+        # The worker is a daemon thread and may be parked in a blocking network
+        # call or the interactive auth server, so only briefly yield to let an
+        # in-flight file write finish — never freeze the menu waiting on it.
+        self._worker.join(timeout=0.5)
         rumps.quit_application()
 
     # -------------------------------------------------------------- helpers
