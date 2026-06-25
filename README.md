@@ -152,7 +152,7 @@ launchctl unload ~/Library/LaunchAgents/com.doctopdf.agent.plist
 
 ```
 doctopdf/
-  app.py       # rumps app: menu, status, watch loop (background worker + UI timer)
+  app.py       # native AppKit menu bar: status item, menu, watch loop (worker + UI timer)
   drive.py     # Google auth + Drive get/export helpers
   config.py    # config load/save + token/config paths
 requirements.txt

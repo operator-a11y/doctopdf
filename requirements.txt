@@ -1,4 +1,7 @@
-rumps>=0.4.0
+# Native macOS menu bar via PyObjC (AppKit). rumps was dropped: it relies on
+# APIs deprecated since macOS 10.10 and its menu does not render on macOS 26's
+# NSSceneStatusItem.
+pyobjc-framework-Cocoa>=10.0
 google-api-python-client>=2.0.0
 google-auth-oauthlib>=1.0.0
 google-auth>=2.0.0

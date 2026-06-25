@@ -1,13 +1,21 @@
-"""DocToPDF menu-bar app: status item, menu, and the watch loop.
+"""DocToPDF menu-bar app: native AppKit status item, menu, and the watch loop.
+
+Why native AppKit instead of rumps
+----------------------------------
+rumps configures its status item with APIs deprecated since macOS 10.10
+(``setHighlightMode_``/``setTitle_``/``setImage_`` on ``NSStatusItem``) and its
+``NSMenu`` does not render on macOS 26's ``NSSceneStatusItem`` — the icon shows
+but the menu never drops down. This module drives ``NSStatusItem``/``NSMenu``
+directly (title on the button, ``setMenu_`` for click-to-open), which works on
+macOS 26.
 
 Threading model
 ---------------
-Network + file I/O must never block the Cocoa run loop, so all Drive work runs
-on a dedicated background worker thread. The worker only mutates a lock-guarded
-``self._state`` snapshot; it never touches rumps/AppKit objects. A lightweight
-``rumps.Timer`` (1 s, main thread) reads that snapshot and updates the menu and
-status-item title. This keeps every UI mutation on the main thread while keeping
-it responsive during multi-second exports and the interactive auth flow.
+All Drive network/file I/O runs on a dedicated background worker thread that only
+mutates a lock-guarded ``self._state`` snapshot — it never touches AppKit. A
+repeating main-thread ``NSTimer`` (1 s) reads that snapshot and updates the menu
+and status-item title. Every UI mutation stays on the main thread, and the menu
+stays responsive during multi-second exports and the interactive auth flow.
 """
 
 from __future__ import annotations
@@ -18,7 +26,20 @@ import threading
 import time
 from pathlib import Path
 
-import rumps
+import objc
+from AppKit import (
+    NSAlert,
+    NSAlertFirstButtonReturn,
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+    NSMenu,
+    NSMenuItem,
+    NSStatusBar,
+    NSTextField,
+    NSTimer,
+    NSVariableStatusItemLength,
+)
+from Foundation import NSMakeRect, NSObject
 
 from . import config, drive
 from .drive import AuthFlowError, DriveError, ReauthRequired
@@ -54,10 +75,17 @@ def sanitize_filename(name: str) -> str:
     return name[:MAX_NAME_LEN]
 
 
-class DocToPDFApp(rumps.App):
-    def __init__(self) -> None:
-        super().__init__("DocToPDF", title=ICON_IDLE, quit_button=None)
+class DocToPDFController(NSObject):
+    # ------------------------------------------------------------------ init
+    def init(self):
+        self = objc.super(DocToPDFController, self).init()
+        if self is None:
+            return None
+        self._setup()
+        return self
 
+    @objc.python_method
+    def _setup(self) -> None:
         self._config = config.load_config()
         base = self._config.get("poll_interval", config.DEFAULT_CONFIG["poll_interval"])
         try:
@@ -88,50 +116,67 @@ class DocToPDFApp(rumps.App):
         self._wake = threading.Event()
         self._worker = threading.Thread(target=self._run_worker, name="watch", daemon=True)
 
-        # --- menu ----------------------------------------------------------
-        self._mi_status = rumps.MenuItem("Starting…")        # disabled (no callback)
-        self._mi_last = rumps.MenuItem("Last export: —")     # disabled
-        self._mi_export = rumps.MenuItem("Export now", callback=self.on_export_now)
-        self._mi_open = rumps.MenuItem("Open PDF", callback=self.on_open_pdf)
-        self._mi_reveal = rumps.MenuItem("Reveal in Finder", callback=self.on_reveal)
-        self._mi_pause = rumps.MenuItem("Pause", callback=self.on_toggle_pause)
-        self._mi_setdoc = rumps.MenuItem("Set Google Doc…", callback=self.on_set_doc)
-        self._mi_quit = rumps.MenuItem("Quit", callback=self.on_quit)
-        self.menu = [
-            self._mi_status,
-            self._mi_last,
-            None,
-            self._mi_export,
-            self._mi_open,
-            self._mi_reveal,
-            None,
-            self._mi_pause,
-            self._mi_setdoc,
-            None,
-            self._mi_quit,
-        ]
+        self._cur_title = None
+        self._build_status_item()
 
-        self._cur_title = ICON_IDLE
-        self._ui_timer = rumps.Timer(self._refresh_ui, 1)
-
-    # ------------------------------------------------------------------ run
-    def start(self) -> None:
         self._worker.start()
-        self._ui_timer.start()
-        self.run()
+        # Repeating main-thread timer renders state onto the menu.
+        self._uitimer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0, self, "refreshUI:", None, True
+        )
+        self.refreshUI_(None)
+
+    @objc.python_method
+    def _build_status_item(self) -> None:
+        bar = NSStatusBar.systemStatusBar()
+        self.statusitem = bar.statusItemWithLength_(NSVariableStatusItemLength)
+        self.statusitem.button().setTitle_(ICON_IDLE)
+
+        menu = NSMenu.alloc().init()
+        menu.setAutoenablesItems_(False)  # we manage enabled state ourselves
+
+        def disabled(title):
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
+            item.setEnabled_(False)
+            menu.addItem_(item)
+            return item
+
+        def action(title, selector):
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, selector, "")
+            item.setTarget_(self)
+            menu.addItem_(item)
+            return item
+
+        self._mi_status = disabled("Starting…")
+        self._mi_last = disabled("Last export: —")
+        menu.addItem_(NSMenuItem.separatorItem())
+        action("Export now", "onExportNow:")
+        action("Open PDF", "onOpenPDF:")
+        action("Reveal in Finder", "onReveal:")
+        menu.addItem_(NSMenuItem.separatorItem())
+        self._mi_pause = action("Pause", "onTogglePause:")
+        action("Set Google Doc…", "onSetDoc:")
+        menu.addItem_(NSMenuItem.separatorItem())
+        action("Quit", "onQuit:")
+
+        self.statusitem.setMenu_(menu)
 
     # ----------------------------------------------------------- state util
+    @objc.python_method
     def _update_state(self, **kwargs) -> None:
         with self._lock:
             self._state.update(kwargs)
 
+    @objc.python_method
     def _set_error(self, msg: str) -> None:
         self._update_state(kind="error", error_msg=msg)
 
+    @objc.python_method
     def _reset_interval(self) -> None:
         with self._lock:
             self._interval = self._base_interval
 
+    @objc.python_method
     def _backoff(self) -> None:
         with self._lock:
             # Ceiling is at least the configured interval, so a base poll interval
@@ -139,11 +184,13 @@ class DocToPDFApp(rumps.App):
             ceiling = max(MAX_INTERVAL, self._base_interval)
             self._interval = min(ceiling, max(self._base_interval, self._interval) * 2)
 
+    @objc.python_method
     def _sleep_or_wake(self, timeout: float) -> None:
         if self._wake.wait(timeout):
             self._wake.clear()
 
     # -------------------------------------------------------------- worker
+    @objc.python_method
     def _run_worker(self) -> None:
         while not self._stop.is_set():
             with self._lock:
@@ -218,6 +265,7 @@ class DocToPDFApp(rumps.App):
                     self._update_state(kind="paused")
             self._sleep_or_wake(interval)
 
+    @objc.python_method
     def _authorize(self) -> bool:
         """Acquire credentials/service. Returns True on success."""
         self._update_state(kind="authorizing")
@@ -237,6 +285,7 @@ class DocToPDFApp(rumps.App):
             self._set_error(f"Auth error: {exc}")
             return False
 
+    @objc.python_method
     def _poll_once(self, doc_id: str, force: bool) -> None:
         meta = drive.get_file_metadata(self.service, doc_id)
         drive.maybe_persist_refreshed_token(self.creds)
@@ -260,8 +309,8 @@ class DocToPDFApp(rumps.App):
 
         # The metadata fetch + export are unlocked network calls; if the user
         # switched docs mid-cycle, don't clobber the new doc's baseline/status
-        # with this (now-stale) result. on_set_doc already reset things under
-        # the lock and queued a fresh forced poll.
+        # with this (now-stale) result. onSetDoc already reset things under the
+        # lock and queued a fresh forced poll.
         with self._lock:
             if self.doc_id != doc_id:
                 return
@@ -273,6 +322,7 @@ class DocToPDFApp(rumps.App):
             last_pdf_path=str(path),
         )
 
+    @objc.python_method
     def _write_pdf(self, name: str, doc_id: str, data: bytes) -> Path:
         out_dir = config.resolve_output_dir(self._config)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -297,7 +347,7 @@ class DocToPDFApp(rumps.App):
         return path
 
     # ----------------------------------------------------------- UI refresh
-    def _refresh_ui(self, _timer) -> None:
+    def refreshUI_(self, _timer) -> None:
         with self._lock:
             st = dict(self._state)
             paused = self._paused
@@ -306,7 +356,6 @@ class DocToPDFApp(rumps.App):
         name = st["doc_name"]
         err = st["error_msg"]
 
-        # Status item + title icon.
         if paused:
             title, status = ICON_PAUSED, "Paused"
         elif kind == "error":
@@ -323,30 +372,32 @@ class DocToPDFApp(rumps.App):
             title, status = ICON_IDLE, "Starting…"
 
         if title != self._cur_title:
-            self.title = title
+            self.statusitem.button().setTitle_(title)
             self._cur_title = title
-        self._mi_status.title = status
+        self._mi_status.setTitle_(status)
 
         last = st["last_export_time"]
-        self._mi_last.title = f"Last export: {last}" if last else "Last export: —"
-        self._mi_pause.title = "Resume" if paused else "Pause"
+        self._mi_last.setTitle_(f"Last export: {last}" if last else "Last export: —")
+        self._mi_pause.setTitle_("Resume" if paused else "Pause")
 
     # ------------------------------------------------------------- actions
-    def on_set_doc(self, _sender) -> None:
-        win = rumps.Window(
-            message="Paste a Google Doc URL or ID:",
-            title="Set Google Doc",
-            default_text=self.doc_id or "",
-            ok="Set",
-            cancel="Cancel",
-            dimensions=(360, 24),
-        )
-        response = win.run()
-        if not response.clicked:
+    def onSetDoc_(self, _sender) -> None:
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Set Google Doc")
+        alert.setInformativeText_("Paste a Google Doc URL or ID:")
+        alert.addButtonWithTitle_("Set")
+        alert.addButtonWithTitle_("Cancel")
+        field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 320, 24))
+        field.setStringValue_(self.doc_id or "")
+        alert.setAccessoryView_(field)
+        alert.window().setInitialFirstResponder_(field)
+
+        if alert.runModal() != NSAlertFirstButtonReturn:
             return
-        doc_id = drive.parse_doc_id(response.text)
+        doc_id = drive.parse_doc_id(field.stringValue())
         if not doc_id:
-            rumps.alert("Invalid Doc", "Couldn't find a Google Doc ID in that text.")
+            self._alert("Invalid Doc", "Couldn't find a Google Doc ID in that text.")
             return
         with self._lock:
             self.doc_id = doc_id
@@ -360,9 +411,9 @@ class DocToPDFApp(rumps.App):
         config.save_config(self._config)
         self._wake.set()
 
-    def on_export_now(self, _sender) -> None:
+    def onExportNow_(self, _sender) -> None:
         if not self.doc_id:
-            rumps.alert("No Doc", "Set a Google Doc first.")
+            self._alert("No Doc", "Set a Google Doc first.")
             return
         with self._lock:
             self._force = True
@@ -370,45 +421,64 @@ class DocToPDFApp(rumps.App):
             self._interval = self._base_interval
         self._wake.set()
 
-    def on_open_pdf(self, _sender) -> None:
+    def onOpenPDF_(self, _sender) -> None:
         path = self._current_pdf_path()
         if path and path.exists():
             subprocess.run(["open", str(path)], check=False)
         else:
-            rumps.alert("No PDF yet", "Nothing has been exported yet.")
+            self._alert("No PDF yet", "Nothing has been exported yet.")
 
-    def on_reveal(self, _sender) -> None:
+    def onReveal_(self, _sender) -> None:
         path = self._current_pdf_path()
         if path and path.exists():
             subprocess.run(["open", "-R", str(path)], check=False)
         else:
-            rumps.alert("No PDF yet", "Nothing has been exported yet.")
+            self._alert("No PDF yet", "Nothing has been exported yet.")
 
-    def on_toggle_pause(self, _sender) -> None:
+    def onTogglePause_(self, _sender) -> None:
         with self._lock:
             self._paused = not self._paused
             if not self._paused:
                 self._auth_blocked = False  # resuming counts as a retry
         self._wake.set()
 
-    def on_quit(self, _sender) -> None:
+    def onQuit_(self, _sender) -> None:
         self._stop.set()
         self._wake.set()
         # The worker is a daemon thread and may be parked in a blocking network
         # call or the interactive auth server, so only briefly yield to let an
         # in-flight file write finish — never freeze the menu waiting on it.
         self._worker.join(timeout=0.5)
-        rumps.quit_application()
+        NSApplication.sharedApplication().terminate_(None)
 
     # -------------------------------------------------------------- helpers
+    @objc.python_method
     def _current_pdf_path(self):
         with self._lock:
             p = self._state.get("last_pdf_path")
         return Path(p) if p else None
 
+    @objc.python_method
+    def _alert(self, title: str, message: str) -> None:
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(title)
+        alert.setInformativeText_(message)
+        alert.addButtonWithTitle_("OK")
+        alert.runModal()
+
+
+# Module-level strong reference so the controller isn't garbage-collected.
+_CONTROLLER = None
+
 
 def main() -> None:
-    DocToPDFApp().start()
+    global _CONTROLLER
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    _CONTROLLER = DocToPDFController.alloc().init()
+    app.activateIgnoringOtherApps_(True)
+    app.run()
 
 
 if __name__ == "__main__":
