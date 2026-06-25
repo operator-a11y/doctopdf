@@ -44,11 +44,14 @@ from Foundation import NSMakeRect, NSObject
 from . import config, drive
 from .drive import AuthFlowError, DriveError, ReauthRequired
 
-# Status-item titles per state.
-ICON_IDLE = "📄"
-ICON_EXPORTING = "🔄"
-ICON_ERROR = "⚠️"
-ICON_PAUSED = "⏸"
+# Status-item title: a visible text label (easy to find in a crowded menu bar)
+# plus a leading state glyph. Pure emoji renders as a faint monochrome glyph
+# that is hard to spot, so we keep the "DocToPDF" word always present.
+LABEL = "DocToPDF"
+GLYPH_IDLE = ""
+GLYPH_EXPORTING = "🔄 "
+GLYPH_ERROR = "⚠️ "
+GLYPH_PAUSED = "⏸ "
 
 MIN_INTERVAL = 3      # never poll faster than this, whatever the config says
 MAX_INTERVAL = 60     # backoff ceiling
@@ -130,7 +133,7 @@ class DocToPDFController(NSObject):
     def _build_status_item(self) -> None:
         bar = NSStatusBar.systemStatusBar()
         self.statusitem = bar.statusItemWithLength_(NSVariableStatusItemLength)
-        self.statusitem.button().setTitle_(ICON_IDLE)
+        self.statusitem.button().setTitle_(LABEL)
 
         menu = NSMenu.alloc().init()
         menu.setAutoenablesItems_(False)  # we manage enabled state ourselves
@@ -357,19 +360,19 @@ class DocToPDFController(NSObject):
         err = st["error_msg"]
 
         if paused:
-            title, status = ICON_PAUSED, "Paused"
+            title, status = GLYPH_PAUSED + LABEL, "Paused"
         elif kind == "error":
-            title, status = ICON_ERROR, f"Error: {err}" if err else "Error"
+            title, status = GLYPH_ERROR + LABEL, f"Error: {err}" if err else "Error"
         elif kind == "needs_doc":
-            title, status = ICON_IDLE, "No Doc set — choose one"
+            title, status = GLYPH_IDLE + LABEL, "No Doc set — choose one"
         elif kind == "authorizing":
-            title, status = ICON_IDLE, "Authorizing in browser…"
+            title, status = GLYPH_IDLE + LABEL, "Authorizing in browser…"
         elif kind == "exporting":
-            title, status = ICON_EXPORTING, f"Exporting: {name or '…'}"
+            title, status = GLYPH_EXPORTING + LABEL, f"Exporting: {name or '…'}"
         elif kind == "watching":
-            title, status = ICON_IDLE, f"Watching: {name or '…'}"
+            title, status = GLYPH_IDLE + LABEL, f"Watching: {name or '…'}"
         else:  # starting
-            title, status = ICON_IDLE, "Starting…"
+            title, status = GLYPH_IDLE + LABEL, "Starting…"
 
         if title != self._cur_title:
             self.statusitem.button().setTitle_(title)
