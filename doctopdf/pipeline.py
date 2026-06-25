@@ -19,22 +19,69 @@ from typing import Optional
 from . import config, drive
 
 # Google Docs export targets: format key -> (export MIME type, file extension).
-EXPORT_FORMATS: dict[str, tuple[str, str]] = {
-    "pdf": ("application/pdf", "pdf"),
-    "docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"),
-    "odt": ("application/vnd.oasis.opendocument.text", "odt"),
-    "rtf": ("application/rtf", "rtf"),
-    "txt": ("text/plain", "txt"),
-    "html": ("text/html", "html"),
-    "md": ("text/markdown", "md"),
-    "epub": ("application/epub+zip", "epub"),
+GOOGLE_PREFIX = "application/vnd.google-apps."
+
+# Per Google-native type, the export targets: format key -> (export MIME, ext).
+# A file's type is derived from its mimeType (document/spreadsheet/presentation/
+# drawing). "pdf" works for all; type-specific formats only apply to that type.
+FORMATS_BY_TYPE: dict[str, dict[str, tuple[str, str]]] = {
+    "document": {
+        "pdf": ("application/pdf", "pdf"),
+        "docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"),
+        "odt": ("application/vnd.oasis.opendocument.text", "odt"),
+        "rtf": ("application/rtf", "rtf"),
+        "txt": ("text/plain", "txt"),
+        "html": ("text/html", "html"),
+        "md": ("text/markdown", "md"),
+        "epub": ("application/epub+zip", "epub"),
+    },
+    "spreadsheet": {
+        "pdf": ("application/pdf", "pdf"),
+        "xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"),
+        "ods": ("application/vnd.oasis.opendocument.spreadsheet", "ods"),
+        "csv": ("text/csv", "csv"),
+        "tsv": ("text/tab-separated-values", "tsv"),
+    },
+    "presentation": {
+        "pdf": ("application/pdf", "pdf"),
+        "pptx": ("application/vnd.openxmlformats-officedocument.presentationml.presentation", "pptx"),
+        "odp": ("application/vnd.oasis.opendocument.presentation", "odp"),
+        "txt": ("text/plain", "txt"),
+    },
+    "drawing": {
+        "pdf": ("application/pdf", "pdf"),
+        "png": ("image/png", "png"),
+        "jpg": ("image/jpeg", "jpg"),
+        "svg": ("image/svg+xml", "svg"),
+    },
 }
 
-# Formats that diff well as plain text (used for the git snapshot).
-TEXT_FORMATS = ("md", "txt", "html")
+# Sensible default formats per type when the config requests none valid for it.
+DEFAULT_FORMATS_BY_TYPE = {
+    "document": ["pdf"], "spreadsheet": ["pdf"],
+    "presentation": ["pdf"], "drawing": ["pdf"],
+}
+
+# Formats that diff well as plain text (used for the git snapshot), per type.
+TEXT_FORMATS = ("md", "txt", "html", "csv", "tsv")
+
+# All export-format keys (any type) — for surfacing/validation.
+EXPORT_FORMATS = {f for table in FORMATS_BY_TYPE.values() for f in table}
 
 MAX_NAME_LEN = 200
 HOOK_TIMEOUT = 120  # seconds
+
+
+def google_type(mime_type: Optional[str]) -> Optional[str]:
+    """Short Google-native type ('document'/'spreadsheet'/...) or None."""
+    if mime_type and mime_type.startswith(GOOGLE_PREFIX):
+        return mime_type[len(GOOGLE_PREFIX):]
+    return None
+
+
+def is_exportable(mime_type: Optional[str]) -> bool:
+    """True if this Google file type can be exported (has a format table)."""
+    return google_type(mime_type) in FORMATS_BY_TYPE
 
 
 def sanitize_filename(name: str) -> str:
@@ -55,20 +102,27 @@ def sanitize_filename(name: str) -> str:
     return name[:MAX_NAME_LEN]
 
 
-def resolve_formats(cfg: dict) -> list[str]:
-    """Return the validated, de-duplicated list of output formats (never empty)."""
-    raw = cfg.get("formats") or ["pdf"]
+def resolve_formats(cfg: dict, gtype: str = "document") -> list[str]:
+    """Return the de-duplicated output formats valid for ``gtype`` (never empty).
+
+    The configured ``formats`` may list formats for several types at once (e.g.
+    ['pdf', 'docx', 'xlsx']); each file keeps only those valid for its own type,
+    so a combined list "just works" across Docs/Sheets/Slides. Falls back to the
+    type's default when none of the requested formats apply.
+    """
+    table = FORMATS_BY_TYPE.get(gtype, {"pdf": ("application/pdf", "pdf")})
+    raw = cfg.get("formats") or []
     if isinstance(raw, str):
         raw = [raw]
     elif not isinstance(raw, (list, tuple)):
-        raw = []  # malformed config (e.g. a number) → fall back to default
+        raw = []
     seen, out = set(), []
     for f in raw:
         f = str(f).lower().lstrip(".")
-        if f in EXPORT_FORMATS and f not in seen:
+        if f in table and f not in seen:
             seen.add(f)
             out.append(f)
-    return out or ["pdf"]
+    return out or list(DEFAULT_FORMATS_BY_TYPE.get(gtype, ["pdf"]))
 
 
 # ---------------------------------------------------------------------------
@@ -226,15 +280,16 @@ def run_hook(cmd: str, primary: Optional[Path], doc_name: str, files: list[Path]
 # ---------------------------------------------------------------------------
 
 
-def run_export(cfg: dict, service, file_id: str, name: str) -> dict:
-    """Export the doc in all configured formats, write outputs, optionally commit
-    to git history and run the post-export hook.
+def run_export(cfg: dict, service, file_id: str, name: str, gtype: str = "document") -> dict:
+    """Export the file in all configured formats valid for ``gtype``, write
+    outputs, optionally commit to git history and run the post-export hook.
 
     Returns ``{primary, written: {fmt: Path}, commit, warning}``. Format export
     and output writing raise on failure (the caller treats those as real export
     errors); git/hook problems are caught and returned as ``warning``.
     """
-    formats = resolve_formats(cfg)
+    table = FORMATS_BY_TYPE.get(gtype, {"pdf": ("application/pdf", "pdf")})
+    formats = resolve_formats(cfg, gtype)
     base = sanitize_filename(name) or file_id
     out_dir = config.resolve_output_dir(cfg)
     timestamped = bool(cfg.get("timestamped", False))
@@ -245,15 +300,17 @@ def run_export(cfg: dict, service, file_id: str, name: str) -> dict:
     git_repo = cfg.get("git_repo")
 
     # Decide every format we must export: the requested outputs, plus a text
-    # format for the git snapshot so history has real diffs.
+    # format (valid for this type) for the git snapshot so history has real diffs.
     needed = list(formats)
     if git_repo and cfg.get("git_snapshot_text", True):
         if not any(f in TEXT_FORMATS for f in needed):
-            needed.append("md")
+            snap = next((f for f in table if f in TEXT_FORMATS), None)
+            if snap:
+                needed.append(snap)
 
     blobs: dict[str, tuple[str, bytes]] = {}
     for fmt in needed:
-        mime, ext = EXPORT_FORMATS[fmt]
+        mime, ext = table[fmt]
         blobs[fmt] = (ext, drive.export(service, file_id, mime))
 
     written: dict[str, Path] = {}

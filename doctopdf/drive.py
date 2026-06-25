@@ -210,6 +210,33 @@ def get_file_metadata(service, file_id: str) -> dict:
     )
 
 
+def list_folder(service, folder_id: str) -> list[dict]:
+    """List non-trashed files directly in a folder.
+
+    Returns ``[{id, name, modifiedTime, mimeType}, …]`` across all pages.
+    """
+    def _fetch():
+        items, token = [], None
+        while True:
+            resp = (
+                service.files()
+                .list(
+                    q=f"'{folder_id}' in parents and trashed = false",
+                    fields="nextPageToken, files(id, name, modifiedTime, mimeType)",
+                    pageSize=200,
+                    orderBy="name",
+                    pageToken=token,
+                )
+                .execute()
+            )
+            items.extend(resp.get("files", []))
+            token = resp.get("nextPageToken")
+            if not token:
+                return items
+
+    return _call(_fetch, folder_id)
+
+
 def export(service, file_id: str, mime_type: str) -> bytes:
     """Export the Google Doc to the given MIME type and return the bytes.
 

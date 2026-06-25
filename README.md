@@ -1,19 +1,26 @@
 # DocToPDF
 
-A tiny macOS **menu-bar app** that watches a single Google Doc and automatically
-re-exports it to a PDF on your Desktop whenever the doc changes (polling every
-~10 seconds). Edit the doc in Google Docs, and within ~10–20 seconds a fresh
-`~/Desktop/<DocName>.pdf` appears, overwriting the previous copy.
+A macOS **menu-bar app** that watches Google **Docs, Sheets, Slides** — or whole
+**Drive folders** — and automatically re-exports them to your Desktop whenever
+they change (polling every ~10 seconds). Edit in Google, and within ~10–20
+seconds a fresh `~/Desktop/<Name>.pdf` (and any other formats you pick) appears.
+
+Also: **multi-format export** (pdf/docx/xlsx/pptx/md/…), **git version history**
+with text diffs, **rolling versions**, a **post-export shell hook**, macOS
+**notifications**, and **launch-at-login**.
 
 ```
-📄  DocToPDF
- ├─ Watching: My Document
+DocToPDF
+ ├─ Watching: My Document          (or "Watching: 5 items")
  ├─ Last export: 14:32:07
+ ├─ Watching ▸                     (list of watched docs/folders; click to remove)
  ├─ Export now
- ├─ Open PDF
+ ├─ Open Export
  ├─ Reveal in Finder
+ ├─ Recent exports ▸
  ├─ Pause
- ├─ Set Google Doc…
+ ├─ Add Doc or Folder…
+ ├─ ✓ Launch at Login
  └─ Quit
 ```
 
@@ -55,13 +62,13 @@ python -m doctopdf.app
 > If `python3` is an older version, use an explicit one, e.g.
 > `python3.12 -m venv .venv`.
 
-The app appears as a **📄** icon in the menu bar. On first run it prompts for
+The app shows a **DocToPDF** label in the menu bar. On first run it prompts for
 Google authorization. Then:
 
-1. Click the icon → **Set Google Doc…**
-2. Paste a Doc **URL** (`https://docs.google.com/document/d/<ID>/edit`) or a bare
-   **Doc ID**.
-3. That's it — the Desktop PDF starts updating automatically.
+1. Click the label → **Add Doc or Folder…**
+2. Paste a Doc/Sheet/Slides **URL** or **ID** — or a Drive **folder** URL/ID to
+   mirror everything in it. Add as many as you like.
+3. That's it — the Desktop exports start updating automatically.
 
 ---
 
@@ -70,15 +77,18 @@ Google authorization. Then:
 | Item | What it does |
 | --- | --- |
 | **Watching: …** / **Last export: …** | Live status (or an error message). |
-| **Export now** | Force an immediate re-export. |
-| **Open PDF** | Open the exported PDF in your default viewer. |
-| **Reveal in Finder** | Select the PDF in Finder. |
+| **Watching ▸** | Lists each watched doc/folder; click one to stop watching it. |
+| **Export now** | Force an immediate re-export of everything. |
+| **Open Export** | Open the most recent export in your default viewer. |
+| **Reveal in Finder** | Select the most recent export in Finder. |
+| **Recent exports ▸** | The last 15 exports; click any to open it. |
 | **Pause / Resume** | Stop/start the watch loop. |
-| **Set Google Doc…** | Change which Doc is watched. |
+| **Add Doc or Folder…** | Add a doc, sheet, slides, or folder to the watch list. |
+| **Launch at Login** | Toggle auto-start at login (✓ when on). |
 | **Quit** | Exit the app. |
 
-The menu-bar icon reflects state: **📄** watching/idle, **🔄** exporting,
-**⏸** paused, **⚠️** error.
+The menu-bar label gets a leading glyph by state: **🔄** exporting,
+**⏸** paused, **⚠️** error (otherwise plain).
 
 ---
 
@@ -97,15 +107,36 @@ Settings persist to `~/Library/Application Support/DocToPDF/config.json`:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `doc_id` | `null` | The watched Google Doc ID (set via the menu). |
+| `watch` | `[]` | Watch list — managed via the menu. Each entry is `{"id": <file/folder id>, "output_dir"?, "formats"?}`; per-entry keys override the globals. |
 | `output_dir` | `~/Desktop` | Where exported files are written. |
 | `poll_interval` | `10` | Seconds between change checks (min 3). |
-| `timestamped` | `false` | If `true`, write `<DocName> <timestamp>.<ext>` (keeps every version) instead of overwriting. |
-| `formats` | `["pdf"]` | Formats to export each change. Any of `pdf`, `docx`, `odt`, `rtf`, `txt`, `html`, `md`, `epub`. |
+| `timestamped` | `false` | If `true`, write `<Name> <timestamp>.<ext>` (keeps every version) instead of overwriting. |
+| `formats` | `["pdf"]` | Formats to export each change. **Filtered per file type** (see below). Docs: `pdf, docx, odt, rtf, txt, html, md, epub`; Sheets: `pdf, xlsx, ods, csv, tsv`; Slides: `pdf, pptx, odp, txt`; Drawings: `pdf, png, jpg, svg`. |
 | `keep_versions` | `0` | Rolling history: if `> 0`, write timestamped files and keep only the newest N **per format**. |
 | `git_repo` | `null` | Path to a git repo. On each change the exports are committed there (full version history). |
-| `git_snapshot_text` | `true` | When `git_repo` is set, also commit a `.md` snapshot so history has real text diffs. |
+| `git_snapshot_text` | `true` | When `git_repo` is set, also commit a text snapshot (md/csv/…) so history has real diffs. |
 | `post_export_cmd` | `null` | Shell command run after each export (see below). |
+| `notify` | `false` | Post a macOS notification on each export. |
+
+> `doc_id` (a legacy single-doc id) is auto-migrated into `watch` on first launch.
+
+### Watch many docs, folders, and Sheets/Slides
+
+Add docs/sheets/slides/folders via **Add Doc or Folder…** — or edit `watch`
+directly. A folder mirrors every exportable Google file inside it. `formats` may
+list formats for several types at once; each file keeps only the ones valid for
+its type, so one list "just works":
+
+```jsonc
+{
+  "watch": [
+    { "id": "1AbC...doc" },
+    { "id": "1XyZ...folder", "output_dir": "~/Desktop/Reports" },
+    { "id": "1Sh3...sheet", "formats": ["pdf", "xlsx"] }
+  ],
+  "formats": ["pdf", "docx", "xlsx", "pptx"]  // doc→pdf+docx, sheet→pdf+xlsx, slides→pdf+pptx
+}
+```
 
 Edit the file while the app is closed, then relaunch to pick up changes.
 
@@ -165,7 +196,8 @@ primary file path; `$DOCTOPDF_FILES` lists all written files (newline-separated)
   un-pausing.
 - **10 MB export cap**: the Drive `files.export` endpoint caps PDFs at 10 MB;
   larger docs surface a clear error (streaming export is out of scope).
-- **Single doc** by design — one Doc at a time.
+- **Many targets** — watch any number of docs/sheets/slides/folders at once;
+  each tracked independently (only changed files re-export).
 
 ---
 
@@ -194,10 +226,11 @@ launchctl unload ~/Library/LaunchAgents/com.doctopdf.agent.plist
 
 ```
 doctopdf/
-  app.py       # native AppKit menu bar: status item, menu, watch loop (worker + UI timer)
-  drive.py     # Google auth + Drive get/export helpers
-  pipeline.py  # export pipeline: multi-format, output modes, git history, post-export hook
-  config.py    # config load/save + token/config paths
+  app.py         # native AppKit menu bar: status item, menu, multi-target watch loop
+  drive.py       # Google auth + Drive get/list/export helpers
+  pipeline.py    # export pipeline: type-aware formats, output modes, git history, hook
+  launchagent.py # install/remove the launch-at-login LaunchAgent
+  config.py      # config load/save + token/config paths
 requirements.txt
 launchd/com.doctopdf.agent.plist
 README.md
@@ -228,4 +261,4 @@ ever need it.
 - **Auth window says the app is unverified** — expected for a Testing OAuth
   app; proceed (you are the developer and a test user).
 - **Browser didn't open / closed it by accident** — click **Export now** or
-  **Set Google Doc…** to retry authorization.
+  **Add Doc or Folder…** to retry authorization.

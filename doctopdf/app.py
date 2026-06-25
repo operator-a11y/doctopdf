@@ -82,15 +82,27 @@ class DocToPDFController(NSObject):
 
         # --- shared state (guarded by _lock) -------------------------------
         self._lock = threading.RLock()
-        self.doc_id = self._config.get("doc_id")
-        self._last_modified = None          # last seen Drive modifiedTime
+        # Watch list of {id, output_dir?, formats?}. Migrate a legacy single
+        # doc_id into it so existing configs keep working.
+        self._watch = list(self._config.get("watch") or [])
+        legacy = self._config.get("doc_id")
+        if legacy and not any(e.get("id") == legacy for e in self._watch):
+            self._watch.append({"id": legacy})
+        if self._config.get("doc_id"):
+            self._config["doc_id"] = None
+            self._config["watch"] = self._watch
+            config.save_config(self._config)
+        self._modified: dict = {}           # file id -> last seen Drive modifiedTime
+        self._entry_names: dict = {}        # watch-entry id -> menu label
+        self._watch_sig = None              # last-rendered watch submenu signature
         self._interval = self._base_interval
         self._paused = False
         self._force = False                 # force an export next cycle
         self._auth_blocked = False          # interactive auth failed; await user action
         self._state = {
             "kind": "starting",             # starting|authorizing|watching|exporting|error|needs_doc|paused
-            "doc_name": None,
+            "watch_count": 0,               # number of resolved targets
+            "names": [],                    # resolved target display names
             "last_export_time": None,
             "error_msg": None,              # fatal: shown with the ⚠️ menu-bar glyph
             "warning": None,                # non-fatal (git/hook): export still succeeded
@@ -144,6 +156,15 @@ class DocToPDFController(NSObject):
         self._mi_last = disabled("Last export: —")
         self._mi_warn = disabled("")        # non-fatal warning line, hidden unless set
         self._mi_warn.setHidden_(True)
+
+        # "Watching ▸" submenu lists each watched doc/folder (click to remove).
+        self._watch_menu = NSMenu.alloc().init()
+        self._watch_menu.setAutoenablesItems_(False)
+        self._mi_watch = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Watching", None, "")
+        self._mi_watch.setSubmenu_(self._watch_menu)
+        menu.addItem_(self._mi_watch)
+
         menu.addItem_(NSMenuItem.separatorItem())
         action("Export now", "onExportNow:")
         action("Open Export", "onOpenPDF:")
@@ -159,7 +180,7 @@ class DocToPDFController(NSObject):
 
         menu.addItem_(NSMenuItem.separatorItem())
         self._mi_pause = action("Pause", "onTogglePause:")
-        action("Set Google Doc…", "onSetDoc:")
+        action("Add Doc or Folder…", "onAddTarget:")
         self._mi_login = action("Launch at Login", "onToggleLogin:")
         menu.addItem_(NSMenuItem.separatorItem())
         action("Quit", "onQuit:")
@@ -200,7 +221,7 @@ class DocToPDFController(NSObject):
         while not self._stop.is_set():
             with self._lock:
                 paused = self._paused
-                doc_id = self.doc_id
+                watch = list(self._watch)
                 blocked = self._auth_blocked
                 interval = self._interval
                 force_pending = self._force      # peeked, NOT consumed yet
@@ -233,7 +254,7 @@ class DocToPDFController(NSObject):
                 self._sleep_or_wake(1.0)
                 continue
 
-            if not doc_id:
+            if not watch:
                 self._update_state(kind="needs_doc")
                 self._sleep_or_wake(max(interval, 2))
                 continue
@@ -245,7 +266,7 @@ class DocToPDFController(NSObject):
                 self._force = False
 
             try:
-                self._poll_once(doc_id, force)
+                self._poll_all(watch, force)
                 self._reset_interval()
             except AuthFlowError as exc:
                 with self._lock:
@@ -291,79 +312,138 @@ class DocToPDFController(NSObject):
             return False
 
     @objc.python_method
-    def _poll_once(self, doc_id: str, force: bool) -> None:
-        meta = drive.get_file_metadata(self.service, doc_id)
-        drive.maybe_persist_refreshed_token(self.creds)
+    def _resolve_targets(self, watch: list) -> list:
+        """Expand the watch list into concrete file targets (folders → children).
 
-        name = meta.get("name") or doc_id
-        modified = meta.get("modifiedTime")
-        mime = meta.get("mimeType", "")
-        self._update_state(doc_name=name)
+        Each target is ``{id, name, modified, gtype, overrides}``. Raises
+        DriveError/ReauthRequired on auth/network failure (handled by the worker);
+        a single bad/non-exportable entry is skipped, not fatal.
+        """
+        targets, entry_names = [], {}
+        for entry in watch:
+            fid = entry.get("id")
+            if not fid:
+                continue
+            overrides = {k: entry[k] for k in ("output_dir", "formats") if k in entry}
+            meta = drive.get_file_metadata(self.service, fid)
+            drive.maybe_persist_refreshed_token(self.creds)
+            gtype = pipeline.google_type(meta.get("mimeType"))
+            label = meta.get("name") or fid
+            if gtype == "folder":
+                n = 0
+                for child in drive.list_folder(self.service, fid):
+                    cgt = pipeline.google_type(child.get("mimeType"))
+                    if cgt in pipeline.FORMATS_BY_TYPE:
+                        targets.append({
+                            "id": child["id"], "name": child.get("name") or child["id"],
+                            "modified": child.get("modifiedTime"), "gtype": cgt,
+                            "overrides": overrides,
+                        })
+                        n += 1
+                entry_names[fid] = f"📁 {label} ({n})"
+            elif gtype in pipeline.FORMATS_BY_TYPE:
+                targets.append({
+                    "id": fid, "name": label, "modified": meta.get("modifiedTime"),
+                    "gtype": gtype, "overrides": overrides,
+                })
+                entry_names[fid] = label
+            else:
+                entry_names[fid] = f"{label} (unsupported)"
+        with self._lock:
+            self._entry_names = entry_names
+        return targets
 
-        if mime and not mime.startswith("application/vnd.google-apps"):
-            raise DriveError("Not an exportable Google Doc.")
+    @objc.python_method
+    def _poll_all(self, watch: list, force: bool) -> None:
+        targets = self._resolve_targets(watch)
+        notes = []  # per-file DriveErrors + git/hook warnings
+        for t in targets:
+            if self._stop.is_set():
+                return
+            with self._lock:
+                if self._paused:
+                    break
+            try:
+                warning = self._poll_file(t, force)
+                if warning:
+                    notes.append(warning)
+            except ReauthRequired:
+                raise  # bubble up so the worker drops the stale service
+            except DriveError as exc:
+                notes.append(f"{t['name']}: {exc}")
 
-        changed = force or (modified != self._last_modified)
-        if not changed:
-            self._update_state(kind="watching", error_msg=None)
-            return
+        # Publish batch status; clears stale warnings on a fully clean cycle.
+        with self._lock:
+            self._state["kind"] = "watching"
+            self._state["error_msg"] = None
+            self._state["watch_count"] = len(targets)
+            self._state["names"] = [t["name"] for t in targets]
+            if not notes:
+                self._state["warning"] = None
+            elif len(notes) == 1:
+                self._state["warning"] = notes[0]
+            else:
+                self._state["warning"] = f"{len(notes)} issues (e.g. {notes[0]})"
 
-        self._update_state(kind="exporting", error_msg=None)
-        # Export all configured formats, write outputs, and (if configured) commit
-        # to git history and run the post-export hook.
-        result = pipeline.run_export(self._config, self.service, doc_id, name)
+    @objc.python_method
+    def _poll_file(self, t: dict, force: bool):
+        """Export one target if changed. Returns a non-fatal warning string or None."""
+        fid, name, modified, gtype = t["id"], t["name"], t["modified"], t["gtype"]
+        if not (force or modified != self._modified.get(fid)):
+            return None
+
+        self._update_state(kind="exporting")
+        cfg = dict(self._config)
+        cfg.update(t.get("overrides") or {})  # per-target output_dir/formats override
+        result = pipeline.run_export(cfg, self.service, fid, name, gtype)
 
         primary = result.get("primary")
-        warning = result.get("warning")
-        # Publish baseline + status atomically. The metadata fetch + export are
-        # unlocked network calls; if the user switched docs mid-cycle, don't
-        # clobber the new doc's baseline/status with this (now-stale) result —
-        # onSetDoc already reset things and queued a fresh forced poll. git/hook
-        # problems are NON-fatal: stay "watching" (no ⚠️ menu-bar glyph) and
-        # surface them on a dedicated warning line.
         now = time.strftime("%H:%M:%S")
         with self._lock:
-            if self.doc_id != doc_id:
-                self._state["kind"] = "watching"  # clear the transient exporting glyph
-                return
-            self._last_modified = modified
-            self._state.update(
-                kind="watching",
-                error_msg=None,
-                warning=warning,
-                last_export_time=now,
-                last_pdf_path=str(primary) if primary else None,
-            )
+            self._modified[fid] = modified
+            self._state["last_export_time"] = now
             if primary:
+                self._state["last_pdf_path"] = str(primary)
                 self._recent.appendleft({"time": now, "path": str(primary), "name": name})
                 self._recent_dirty = True
 
         if primary and self._config.get("notify"):
             fmts = ", ".join(result.get("written", {}).keys()) or "pdf"
             self._notify(f"{name}", f"Exported {fmts} · {now}")
+        return result.get("warning")
 
     # ----------------------------------------------------------- UI refresh
     def refreshUI_(self, _timer) -> None:
         with self._lock:
             st = dict(self._state)
             paused = self._paused
+            watch_entries = list(self._watch)
+            entry_names = dict(self._entry_names)
 
         kind = st["kind"]
-        name = st["doc_name"]
         err = st["error_msg"]
+        names = st.get("names") or []
+        count = st.get("watch_count", 0)
+        # Concise description of what's being watched.
+        if count == 0:
+            watching = "…"
+        elif count == 1:
+            watching = names[0] if names else "1 item"
+        else:
+            watching = f"{count} items"
 
         if paused:
             title, status = GLYPH_PAUSED + LABEL, "Paused"
         elif kind == "error":
             title, status = GLYPH_ERROR + LABEL, f"Error: {err}" if err else "Error"
         elif kind == "needs_doc":
-            title, status = GLYPH_IDLE + LABEL, "No Doc set — choose one"
+            title, status = GLYPH_IDLE + LABEL, "Nothing watched — add a doc"
         elif kind == "authorizing":
             title, status = GLYPH_IDLE + LABEL, "Authorizing in browser…"
         elif kind == "exporting":
-            title, status = GLYPH_EXPORTING + LABEL, f"Exporting: {name or '…'}"
+            title, status = GLYPH_EXPORTING + LABEL, f"Exporting… ({watching})"
         elif kind == "watching":
-            title, status = GLYPH_IDLE + LABEL, f"Watching: {name or '…'}"
+            title, status = GLYPH_IDLE + LABEL, f"Watching: {watching}"
         else:  # starting
             title, status = GLYPH_IDLE + LABEL, "Starting…"
 
@@ -375,6 +455,12 @@ class DocToPDFController(NSObject):
         last = st["last_export_time"]
         self._mi_last.setTitle_(f"Last export: {last}" if last else "Last export: —")
         self._mi_pause.setTitle_("Resume" if paused else "Pause")
+
+        # "Watching ▸" submenu lists each watched entry; rebuild only on change.
+        sig = repr([(e.get("id"), entry_names.get(e.get("id"))) for e in watch_entries])
+        if sig != self._watch_sig:
+            self._rebuild_watch_menu(watch_entries, entry_names)
+            self._watch_sig = sig
 
         # Non-fatal git/hook warning: shown on its own line, not as the error glyph.
         warn = st.get("warning")
@@ -398,39 +484,61 @@ class DocToPDFController(NSObject):
             self._rebuild_recent_menu(recent)
 
     # ------------------------------------------------------------- actions
-    def onSetDoc_(self, _sender) -> None:
+    def onAddTarget_(self, _sender) -> None:
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         alert = NSAlert.alloc().init()
-        alert.setMessageText_("Set Google Doc")
-        alert.setInformativeText_("Paste a Google Doc URL or ID:")
-        alert.addButtonWithTitle_("Set")
+        alert.setMessageText_("Add Doc or Folder")
+        alert.setInformativeText_(
+            "Paste a Google Doc / Sheet / Slides URL or ID — or a Drive folder "
+            "URL/ID to mirror everything in it.")
+        alert.addButtonWithTitle_("Add")
         alert.addButtonWithTitle_("Cancel")
         field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 320, 24))
-        field.setStringValue_(self.doc_id or "")
         alert.setAccessoryView_(field)
         alert.window().setInitialFirstResponder_(field)
 
         if alert.runModal() != NSAlertFirstButtonReturn:
             return
-        doc_id = drive.parse_doc_id(field.stringValue())
-        if not doc_id:
-            self._alert("Invalid Doc", "Couldn't find a Google Doc ID in that text.")
+        fid = drive.parse_doc_id(field.stringValue())
+        if not fid:
+            self._alert("Invalid link", "Couldn't find a Google file or folder ID in that text.")
             return
         with self._lock:
-            self.doc_id = doc_id
-            self._config["doc_id"] = doc_id
-            self._last_modified = None
+            if any(e.get("id") == fid for e in self._watch):
+                return  # already watched
+            self._watch.append({"id": fid})
+            self._config["watch"] = list(self._watch)
             self._force = True
             self._auth_blocked = False
             self._interval = self._base_interval
-            self._state["doc_name"] = None
-            self._state["error_msg"] = None
+        config.save_config(self._config)
+        self._wake.set()
+
+    def onRemoveTarget_(self, sender) -> None:
+        fid = sender.representedObject()
+        with self._lock:
+            label = self._entry_names.get(fid, fid)
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Stop watching?")
+        alert.setInformativeText_(f"Remove “{label}” from the watch list?\n"
+                                  "(Already-exported files are kept.)")
+        alert.addButtonWithTitle_("Remove")
+        alert.addButtonWithTitle_("Cancel")
+        if alert.runModal() != NSAlertFirstButtonReturn:
+            return
+        with self._lock:
+            self._watch = [e for e in self._watch if e.get("id") != fid]
+            self._config["watch"] = list(self._watch)
+            self._entry_names.pop(fid, None)
         config.save_config(self._config)
         self._wake.set()
 
     def onExportNow_(self, _sender) -> None:
-        if not self.doc_id:
-            self._alert("No Doc", "Set a Google Doc first.")
+        with self._lock:
+            empty = not self._watch
+        if empty:
+            self._alert("Nothing watched", "Add a Doc or Folder first.")
             return
         with self._lock:
             self._force = True
@@ -503,6 +611,32 @@ class DocToPDFController(NSObject):
         alert.setInformativeText_(message)
         alert.addButtonWithTitle_("OK")
         alert.runModal()
+
+    @objc.python_method
+    def _rebuild_watch_menu(self, entries, entry_names) -> None:
+        """Rebuild the Watching submenu (main thread, from refreshUI_)."""
+        self._watch_menu.removeAllItems()
+        if not entries:
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Nothing watched", None, "")
+            item.setEnabled_(False)
+            self._watch_menu.addItem_(item)
+            return
+        for entry in entries:
+            eid = entry.get("id")
+            if not eid:
+                continue
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                entry_names.get(eid, eid), "onRemoveTarget:", "")
+            item.setTarget_(self)
+            item.setRepresentedObject_(eid)
+            item.setToolTip_("Click to stop watching this item")
+            self._watch_menu.addItem_(item)
+        self._watch_menu.addItem_(NSMenuItem.separatorItem())
+        hint = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Click an item to remove it", None, "")
+        hint.setEnabled_(False)
+        self._watch_menu.addItem_(hint)
 
     @objc.python_method
     def _rebuild_recent_menu(self, recent) -> None:

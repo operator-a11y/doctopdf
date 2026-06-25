@@ -34,7 +34,11 @@ SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    # Google Doc file id to watch (``None`` until the user sets one).
+    # Watch list: each entry is {"id": <file or folder id>, "output_dir"?, "formats"?}.
+    # A folder id mirrors all exportable files inside it. Per-entry output_dir /
+    # formats override the globals below. Managed via the menu.
+    "watch": [],
+    # Legacy single-doc id; migrated into ``watch`` on load (kept for back-compat).
     "doc_id": None,
     # Where exported files are written. ``~`` is expanded on use.
     "output_dir": "~/Desktop",
