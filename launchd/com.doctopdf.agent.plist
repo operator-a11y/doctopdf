@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sample LaunchAgent for auto-starting DocToPDF at login.
+
+  EDIT THE TWO ABSOLUTE PATHS BELOW to match your machine:
+    * ProgramArguments[0]  -> <project>/.venv/bin/python
+    * WorkingDirectory     -> <project>   (so client_secret.json / token.json resolve)
+
+  Then:
+    mkdir -p ~/Library/LaunchAgents
+    cp launchd/com.doctopdf.agent.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.doctopdf.agent.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.doctopdf.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/doctopdf/.venv/bin/python</string>
+        <string>-m</string>
+        <string>doctopdf.app</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE/PATH/TO/doctopdf</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/doctopdf.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/doctopdf.err.log</string>
+</dict>
+</plist>
