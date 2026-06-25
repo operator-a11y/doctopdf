@@ -1,10 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Sample LaunchAgent for auto-starting DocToPDF at login.
 
   EDIT THE TWO ABSOLUTE PATHS BELOW to match your machine:
     * ProgramArguments[0]  -> <project>/.venv/bin/python
-    * WorkingDirectory     -> <project>   (so client_secret.json / token.json resolve)
+    * WorkingDirectory     -> <project>
+        Required so `python -m doctopdf.app` can import the doctopdf package
+        (it runs from source, not an installed wheel). The app finds
+        client_secret.json / token.json from the package location regardless,
+        but launching from the project dir keeps everything consistent.
 
   Then:
     mkdir -p ~/Library/LaunchAgents

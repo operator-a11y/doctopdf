@@ -113,8 +113,14 @@ Edit the file while the app is closed, then relaunch to pick up changes.
 - **No redundant writes**: nothing is exported unless the Doc's `modifiedTime`
   advances.
 - **Auto-recovery**: network/quota errors are shown in the menu and retried with
-  exponential backoff (up to 60 s), resetting on success. Expired tokens refresh
-  automatically — they don't surface as errors.
+  exponential backoff (up to 60 s), resetting on success. Access tokens refresh
+  automatically; if the refresh token itself goes stale (e.g. a Testing-mode
+  token expiring, or a revoked grant), the app re-authorizes on its own and only
+  re-prompts the browser if a silent refresh isn't possible.
+- **Pause**: stops the *next* poll. An export already in flight when you pause
+  completes (a single export is atomic), then no further exports happen until you
+  Resume. **Export now** works even while paused — it performs one export without
+  un-pausing.
 - **10 MB export cap**: the Drive `files.export` endpoint caps PDFs at 10 MB;
   larger docs surface a clear error (streaming export is out of scope).
 - **Single doc** by design — one Doc at a time.
