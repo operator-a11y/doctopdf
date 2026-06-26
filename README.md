@@ -349,6 +349,65 @@ Register it with an MCP client (Claude Desktop / Claude Code):
 
 ---
 
+### Publishing pipeline — Doc → live site / Markdown / branded PDF
+
+Bind a watched source to a **publish target** and DocToPDF re-publishes its
+Markdown on every *stable* change (the same debounced change event the alerts
+use — never a mid-keystroke draft). Three destination types:
+
+- `git_markdown` — write the raw Markdown to a repo and push.
+- `git_pages` — render Markdown → sanitized, themed HTML and push to a dedicated
+  branch, so GitHub Pages / Netlify / Vercel serves a live, auto-updating site
+  (the "Google Docs as CMS" wedge).
+- `pdf_template` — render to a branded HTML/CSS template, then a PDF (via the
+  Playwright Chromium already used for web monitoring).
+
+```jsonc
+"publish": [
+  {
+    "source_id": "<watched target id>",   // whose content to publish
+    "type": "git_pages",                  // git_markdown | git_pages | pdf_template
+    "repo": "git@github.com:user/site.git",
+    "branch": "gh-pages",                 // a dedicated, app-owned branch
+    "path": "index.html",                 // or docs/page.md for git_markdown
+    "template": "default",                // built-in theme, or a path to a custom HTML file
+    "approval": "manual",                 // manual = hold for Approve | auto = on stable change
+    "site_url": "https://user.github.io/site"
+  }
+]
+```
+
+A custom template is any HTML file using `{{ title }}` and `{{ content }}`
+markers (no template engine needed).
+
+**Git auth is yours.** The app shells out to `git` and relies on **your existing
+SSH key or credential helper** for the target repo — it never stores tokens. Make
+sure `git push` to the repo works from your shell first. Auth/conflict/offline
+failures surface in the menu (⚠️) and retry with backoff; nothing is silently
+dropped.
+
+**Safe git.** DocToPDF maintains its own working copy under app data and only
+ever writes the **dedicated branch** you name — it pull-rebases before pushing
+and uses `--force-with-lease` *only on that app-owned branch*, never your `main`.
+Point `branch` at a branch you've reserved for publishing (e.g. `gh-pages`).
+
+**Approval.** `auto` publishes on every stable change. `manual` holds the change
+as **pending** and notifies *"Site has pending changes — review & publish"*;
+nothing goes live until you click the target under **Publishing ▸** (or use
+**Publish now**). **Recommended: `manual` for any public site.** Default is `auto`.
+
+**Status.** The **Publishing ▸** submenu shows each target's state (published +
+time / pending / error) — click to approve a pending one, open the live site, or
+retry an error. **Publish now** publishes the current snapshot of every target.
+
+**Images are a known limitation.** Google Docs image data isn't exported to the
+publish host yet, so embedded images are **stripped with a warning** rather than
+published as broken links. Text, headings, lists, links, and tables publish
+faithfully. (Designed for Docs; a non-Markdown source's snapshot is published
+as-is.)
+
+---
+
 ## Behavior & limits
 
 - **Overwrite by default**: the same `<DocName>.pdf` is rewritten each change, so
@@ -406,6 +465,8 @@ doctopdf/
   audit.py       # Change-history dashboard (HTML report over the event log)
   rag.py         # change-aware vector sync: chunk → embed → Chroma upsert/delete + query
   mcp_server.py  # read-only MCP server exposing search_knowledge over stdio
+  publish.py     # publishing pipeline: md→HTML render/sanitize, safe git push, 3 publishers
+  themes/default.html  # built-in static-site theme ({{ title }} / {{ content }})
   __main__.py    # CLI: python -m doctopdf [app | query | mcp | rag reindex]
   prefs.py       # native tabbed Preferences window
   launchagent.py # install/remove the launch-at-login LaunchAgent
