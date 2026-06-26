@@ -950,6 +950,14 @@ class DocToPDFController(NSObject):
                 digest.mark_sent(datetime.now())
             except Exception:  # noqa: BLE001 — best-effort seed
                 pass
+        # Same guard when change recording is switched on: if no digest baseline
+        # exists yet, seed one so a later digest doesn't dump the backlog that
+        # recording now begins to build. seed_if_unset never clobbers a live one.
+        if not self._config.get("audit_log", True) and cfg.get("audit_log", True):
+            try:
+                digest.seed_if_unset(datetime.now())
+            except Exception:  # noqa: BLE001 — best-effort seed
+                pass
         with self._lock:
             self._config.update(cfg)
             try:

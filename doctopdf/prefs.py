@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import objc
 from AppKit import (
+    NSAlert,
+    NSAlertFirstButtonReturn,
     NSApplication,
     NSBackingStoreBuffered,
     NSButton,
@@ -141,7 +143,9 @@ class PreferencesController(NSObject):
         _label(v, "SMTP user:", 14, y + 2); self.smtp_user = _field(v, cfg.get("smtp_user"), 175, y, 150)
         _label(v, "Pass:", 340, y + 2, 40); self.smtp_pass = _field(v, cfg.get("smtp_pass"), 385, y, 140, secure=True); y -= 32
         _label(v, "Digest:", 14, y + 2); self.digest = _popup(v, ["off", "daily", "weekly"], cfg.get("digest", "off"), 175, y - 2, 110)
-        _label(v, "at hour:", 300, y + 2, 50); self.digest_hour = _field(v, cfg.get("digest_hour", 9), 355, y, 50)
+        _label(v, "at hour:", 300, y + 2, 50); self.digest_hour = _field(v, cfg.get("digest_hour", 9), 355, y, 50); y -= 30
+        self.audit = _check(v, "Record change history (feeds the dashboard + digests)",
+                            cfg.get("audit_log", True), 14, y, 400)
 
         # ---- Advanced ----
         v = self._tab(tabs, "Advanced")
@@ -161,6 +165,16 @@ class PreferencesController(NSObject):
         self.window.center()
 
     @objc.python_method
+    def _confirm(self, title: str, message: str, ok_title: str) -> bool:
+        """Modal OK/Cancel confirm. Returns True if the user chose ``ok_title``."""
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(title)
+        alert.setInformativeText_(message)
+        alert.addButtonWithTitle_(ok_title)
+        alert.addButtonWithTitle_("Cancel")
+        return alert.runModal() == NSAlertFirstButtonReturn
+
+    @objc.python_method
     def show(self) -> None:
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         self.window.makeKeyAndOrderFront_(None)
@@ -171,6 +185,18 @@ class PreferencesController(NSObject):
     def save_(self, _sender) -> None:
         cfg = dict(self.app._config)  # preserves keys not shown here (watch, etc.)
         d = config.DEFAULT_CONFIG
+
+        # Turning change recording off is the consequential direction now — the
+        # audit trail goes silent. Confirm before applying; backing out leaves
+        # the window (and every other edit) untouched.
+        new_audit = bool(self.audit.state())
+        if self.app._config.get("audit_log", True) and not new_audit:
+            if not self._confirm(
+                "Stop recording change history?",
+                "Change history and digests will stop recording new changes.",
+                "Turn Off",
+            ):
+                return
 
         def as_int(tf, default, lo):
             try:
@@ -205,6 +231,7 @@ class PreferencesController(NSObject):
         cfg["smtp_pass"] = self.smtp_pass.stringValue() or None
         cfg["digest"] = self.digest.titleOfSelectedItem() or "off"
         cfg["digest_hour"] = min(23, as_int(self.digest_hour, cfg.get("digest_hour", 9), 0))
+        cfg["audit_log"] = new_audit
         cfg["post_export_cmd"] = self.hook.stringValue().strip() or None
 
         # Launch-at-login is managed via the LaunchAgent, not config.
