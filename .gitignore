@@ -11,3 +11,7 @@ venv/
 
 # macOS
 .DS_Store
+
+# RAG vector store — a local artifact, not the (human-readable) git audit trail
+.vectorstore/
+doctopdf-meta.json

@@ -312,6 +312,7 @@ def run_export(cfg: dict, service, file_id: str, name: str, gtype: str = "docume
         or cfg.get("email_to")
         or (cfg.get("digest", "off") not in (None, "off"))
         or cfg.get("audit_log", True)
+        or (cfg.get("rag") or {}).get("enabled")   # text is the embedding input
     )
     needed = list(formats)
     if want_text and not any(f in TEXT_FORMATS for f in needed):

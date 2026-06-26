@@ -21,6 +21,7 @@ stays responsive during multi-second exports and the interactive auth flow.
 from __future__ import annotations
 
 import hashlib
+import queue
 import subprocess
 import threading
 import time
@@ -46,7 +47,7 @@ from AppKit import (
 from Foundation import NSMakeRect, NSObject
 
 from . import (alerts, audit, config, digest, drive, launchagent, pipeline, prefs,
-               summarize, web)
+               rag, summarize, web)
 from .drive import AuthFlowError, DriveError, ReauthRequired
 from .pipeline import sanitize_filename  # re-exported for convenience
 
@@ -66,6 +67,9 @@ MAX_INTERVAL = 60     # backoff ceiling
 WEB_DEFAULT_INTERVAL = 600   # web targets poll far slower than docs — be polite
 WEB_MIN_INTERVAL = 60        # floor for a web poll interval
 WEB_BACKOFF_CAP = 3600       # max backoff for a bot-blocked site (1h)
+
+RAG_RETRY_BASE = 30          # seconds before the first embed retry
+RAG_RETRY_CAP = 600          # max backoff while the embedder stays down
 
 
 class DocToPDFController(NSObject):
@@ -120,7 +124,26 @@ class DocToPDFController(NSObject):
             "alert_warning": None,          # async alert/classify degradation (not poll-cleared)
             "last_summary": None,           # latest AI change summary (menu line)
             "last_pdf_path": None,
+            "rag_count": None,              # indexed chunk count (None = RAG off)
+            "rag_last_sync": None,          # last time the index changed
+            "rag_note": None,              # degraded note (embedder down / reindex)
         }
+
+        # --- RAG / vector sync plumbing ------------------------------------
+        # A single worker thread drains a queue of sync/delete tasks, so store
+        # writes are serialized and the embedder is never hammered. RAG is
+        # strictly additive: failures queue + surface, never block the watcher.
+        self._rag = None                    # RagStore, or None when disabled
+        self._rag_q: queue.Queue = queue.Queue()
+        self._rag_pending: dict = {}        # target_id -> latest task awaiting retry
+        self._rag_retry_at = 0.0            # monotonic time of next embed retry
+        self._rag_backoff = RAG_RETRY_BASE
+        self._rag_dim_mismatch = False      # set on an embedder swap; needs reindex
+        if (self._config.get("rag") or {}).get("enabled"):
+            try:
+                self._rag = rag.RagStore(self._config)
+            except Exception:  # noqa: BLE001 — never let RAG setup break startup
+                self._rag = None
 
         # Recent exports for the submenu (guarded by _lock; _recent_dirty tells
         # the UI timer to rebuild the submenu).
@@ -150,6 +173,11 @@ class DocToPDFController(NSObject):
         self._build_status_item()
 
         self._worker.start()
+        # Dedicated RAG worker: serializes embed/upsert/delete off the watch loop.
+        if self._rag is not None:
+            self._rag_thread = threading.Thread(
+                target=self._rag_worker, name="doctopdf-rag", daemon=True)
+            self._rag_thread.start()
         # Repeating main-thread timer renders state onto the menu.
         self._uitimer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             1.0, self, "refreshUI:", None, True
@@ -187,6 +215,8 @@ class DocToPDFController(NSObject):
         self._mi_warn.setHidden_(True)
         self._mi_summary = disabled("")     # latest AI change summary, hidden unless set
         self._mi_summary.setHidden_(True)
+        self._mi_rag = disabled("")         # vector index status, hidden unless RAG on
+        self._mi_rag.setHidden_(True)
 
         # "Watching ▸" submenu lists each watched doc/folder (click to remove).
         self._watch_menu = NSMenu.alloc().init()
@@ -213,6 +243,8 @@ class DocToPDFController(NSObject):
         self._mi_pause = action("Pause", "onTogglePause:")
         action("Add Doc or Folder…", "onAddTarget:")
         action("Change history…", "onAuditHistory:")
+        self._mi_reindex = action("Rebuild index", "onRebuildIndex:")
+        self._mi_reindex.setHidden_(True)   # shown only when RAG is enabled
         action("Preferences…", "onPreferences:")
         self._mi_login = action("Launch at Login", "onToggleLogin:")
         menu.addItem_(NSMenuItem.separatorItem())
@@ -356,13 +388,13 @@ class DocToPDFController(NSObject):
         """
         targets, entry_names, errors, seen = [], {}, [], set()
 
-        def add(fid, name, modified, gtype, overrides, who=None):
+        def add(fid, name, modified, gtype, overrides, who=None, rag_flag=None):
             if fid in seen:
                 return
             seen.add(fid)
             targets.append({"kind": "drive", "id": fid, "name": name or fid,
                             "modified": modified, "gtype": gtype, "overrides": overrides,
-                            "who": who})
+                            "who": who, "rag": rag_flag})
 
         def editor(m):
             return (m.get("lastModifyingUser") or {}).get("displayName")
@@ -384,7 +416,7 @@ class DocToPDFController(NSObject):
                     "selector": entry.get("selector"),
                     "mode": (entry.get("mode") or "text"),
                     "poll_seconds": entry.get("poll_seconds", WEB_DEFAULT_INTERVAL),
-                    "overrides": overrides,
+                    "overrides": overrides, "rag": entry.get("rag"),
                 })
                 entry_names[url] = f"🌐 {wname}"
                 continue
@@ -404,11 +436,12 @@ class DocToPDFController(NSObject):
                         cgt = pipeline.google_type(child.get("mimeType"))
                         if cgt in pipeline.FORMATS_BY_TYPE:
                             add(child["id"], child.get("name"), child.get("modifiedTime"),
-                                cgt, overrides, editor(child))
+                                cgt, overrides, editor(child), entry.get("rag"))
                             n += 1
                     entry_names[fid] = f"📁 {label} ({n})"
                 elif gtype in pipeline.FORMATS_BY_TYPE:
-                    add(fid, label, meta.get("modifiedTime"), gtype, overrides, editor(meta))
+                    add(fid, label, meta.get("modifiedTime"), gtype, overrides,
+                        editor(meta), entry.get("rag"))
                     entry_names[fid] = label
                 else:
                     entry_names[fid] = f"{label} (unsupported)"
@@ -462,10 +495,14 @@ class DocToPDFController(NSObject):
                 notes.append(f"{t['name']}: {exc}")
 
         live = {t["id"] for t in targets}
+        dropped = []
         with self._lock:
             # Bound per-target state to currently-resolved targets, but only on a
             # fully clean cycle so a transient failure doesn't drop a baseline.
             if completed and not notes:
+                # Targets we had snapshots for but no longer resolve (target or
+                # folder-child removed) — their vectors must be cleaned up too.
+                dropped = [k for k in self._prev_text if k not in live]
                 self._modified = {k: v for k, v in self._modified.items() if k in live}
                 self._prev_text = {k: v for k, v in self._prev_text.items() if k in live}
                 self._web_next = {k: v for k, v in self._web_next.items() if k in live}
@@ -483,6 +520,11 @@ class DocToPDFController(NSObject):
                     self._state["warning"] = notes[0]
                 else:
                     self._state["warning"] = f"{len(notes)} issues (e.g. {notes[0]})"
+
+        # Purge vectors for removed targets/folder-children (outside the lock).
+        if self._rag is not None and dropped:
+            for tid in dropped:
+                self._rag_enqueue_delete(tid)
 
     @objc.python_method
     def _poll_file(self, t: dict, force: bool):
@@ -511,6 +553,13 @@ class DocToPDFController(NSObject):
         if new_text is not None:
             self._prev_text[fid] = new_text
         has_diff = bool(new_text and old_text is not None and old_text != new_text)
+
+        # RAG: keep the vector store current. Fires on baseline and change (the
+        # store reconciles by hash, so this is incremental); skipped per-target
+        # via an explicit ``rag: false``.
+        if self._rag is not None and new_text and t.get("rag") is not False:
+            self._rag_enqueue_sync(fid, name, rag.kind_for(gtype),
+                                   rag.google_link(gtype, fid), new_text)
 
         # Plain export-confirmation notification only when AI classification is
         # OFF. When it's ON, the change handler notifies *only* on changes that
@@ -577,6 +626,10 @@ class DocToPDFController(NSObject):
                     self._state["last_pdf_path"] = str(path)
                     self._recent.appendleft({"time": now, "path": str(path), "name": name})
                     self._recent_dirty = True
+            # RAG sync on baseline + change (web target_id == url); the store
+            # reconciles by hash so this stays incremental.
+            if self._rag is not None and t.get("rag") is not False:
+                self._rag_enqueue_sync(url, name, "web", url, snap)
             if changed:
                 if cfg.get("notify") and not cfg.get("ai_summary"):
                     self._notify(name, "Page changed")
@@ -602,6 +655,136 @@ class DocToPDFController(NSObject):
             except Exception:  # noqa: BLE001 — git is best-effort
                 pass
         return path
+
+    # ------------------------------------------------------ RAG / vector sync
+    @objc.python_method
+    def _rag_enqueue_sync(self, target_id, name, kind, link, text) -> None:
+        """Queue a target's latest snapshot for incremental (re-)indexing.
+
+        Gated by the global flag and the per-target ``rag`` opt-out at the call
+        sites. Fires on baseline *and* change — the store reconciles by content
+        hash, so an unchanged poll is a no-op and a one-line edit re-embeds one
+        chunk. Never blocks: it just puts a task on the RAG worker's queue.
+        """
+        if self._rag is None or not (text and text.strip()):
+            return
+        self._rag_q.put(("sync", target_id, name, kind, link or "", text))
+
+    @objc.python_method
+    def _rag_enqueue_delete(self, target_id) -> None:
+        """Queue removal of a target's chunks (target/folder-child removed)."""
+        if self._rag is None:
+            return
+        self._rag_q.put(("delete", target_id, None, None, None, None))
+
+    @objc.python_method
+    def _rag_worker(self) -> None:
+        """Drain RAG tasks serially; retry embedder failures with backoff."""
+        # Publish an initial chunk count so the menu shows state before any sync.
+        self._rag_refresh_stats()
+        while not self._stop.is_set():
+            try:
+                task = self._rag_q.get(timeout=1.0)
+            except queue.Empty:
+                self._rag_retry_pending()
+                continue
+            try:
+                self._rag_run(task)
+            finally:
+                self._rag_q.task_done()
+
+    @objc.python_method
+    def _rag_run(self, task) -> None:
+        """Execute one sync/delete task, handling degradation."""
+        action, target_id, name, kind, link, text = task
+        try:
+            if action == "reindex":
+                self._rag_reindex()
+                return
+            if action == "delete":
+                self._rag.delete_target(target_id)
+                self._rag_pending.pop(target_id, None)
+            else:  # sync
+                if self._rag_dim_mismatch:
+                    # Refuse partial sync until a reindex; keep it pending so a
+                    # reindex (which clears the flag) picks it back up.
+                    self._rag_pending[target_id] = task
+                    return
+                self._rag.sync(target_id, name, kind, link, text)
+                self._rag_pending.pop(target_id, None)
+                self._rag_backoff = RAG_RETRY_BASE
+            self._rag_refresh_stats()
+        except rag.DimensionMismatch as exc:
+            self._rag_dim_mismatch = True
+            self._rag_pending[target_id] = task
+            self._rag_set_note(f"Vector index: {exc}")
+        except rag.EmbedError as exc:
+            # Embedder down — keep the latest snapshot for this target and retry.
+            self._rag_pending[target_id] = task
+            self._rag_retry_at = time.monotonic() + self._rag_backoff
+            self._rag_backoff = min(RAG_RETRY_CAP, self._rag_backoff * 2)
+            self._rag_set_note(f"Vector index paused — embedder offline "
+                               f"({len(self._rag_pending)} queued). {exc}")
+        except rag.RagUnavailable as exc:
+            # Store layer is out — disable RAG for this session and surface it.
+            self._rag = None
+            self._rag_set_note(f"Vector index disabled — {exc}")
+        except Exception as exc:  # noqa: BLE001 — never let the RAG worker die
+            self._rag_set_note(f"Vector index error: {exc}")
+
+    @objc.python_method
+    def _rag_retry_pending(self) -> None:
+        """Re-run queued syncs once their backoff elapses (embedder recovered)."""
+        if self._rag is None or not self._rag_pending:
+            return
+        if self._rag_dim_mismatch:
+            return  # only a reindex clears this
+        if time.monotonic() < self._rag_retry_at:
+            return
+        for task in list(self._rag_pending.values()):
+            if self._stop.is_set():
+                return
+            self._rag_run(task)
+
+    @objc.python_method
+    def _rag_refresh_stats(self) -> None:
+        """Read store stats onto the shared state for the menu (RAG thread only)."""
+        if self._rag is None:
+            return
+        try:
+            s = self._rag.stats()
+        except Exception:  # noqa: BLE001 — status must never raise
+            return
+        with self._lock:
+            self._state["rag_count"] = s.get("count")
+            self._state["rag_last_sync"] = s.get("last_sync")
+            # Clear a stale degraded note once we're healthy again.
+            if not self._rag_pending and not self._rag_dim_mismatch:
+                self._state["rag_note"] = None
+
+    @objc.python_method
+    def _rag_set_note(self, note) -> None:
+        with self._lock:
+            self._state["rag_note"] = note
+
+    @objc.python_method
+    def _rag_reindex(self) -> None:
+        """Clear the store and re-sync every target (menu “Rebuild index”)."""
+        if self._rag is None:
+            return
+        try:
+            self._rag.reindex()
+        except Exception as exc:  # noqa: BLE001
+            self._rag_set_note(f"Reindex failed: {exc}")
+            return
+        self._rag_dim_mismatch = False
+        self._rag_pending.clear()
+        self._rag_backoff = RAG_RETRY_BASE
+        self._rag_set_note(None)
+        self._rag_refresh_stats()
+        with self._lock:
+            self._force = True      # next poll re-captures + re-embeds every target
+        self._wake.set()
 
     @objc.python_method
     def _handle_change(self, name, old_text, new_text, cfg, who=None) -> None:
@@ -765,6 +948,26 @@ class DocToPDFController(NSObject):
         else:
             self._mi_summary.setHidden_(True)
 
+        # Vector index status (chunk count + last sync, or a degraded note).
+        if self._rag is not None:
+            note = st.get("rag_note")
+            if note:
+                line = f"🧠 {note if len(note) <= 88 else note[:86] + '…'}"
+            else:
+                cnt = st.get("rag_count")
+                last = st.get("rag_last_sync")
+                when = (last or "").replace("T", " ")[:16]
+                line = (f"🧠 Indexed {cnt} chunk(s)" if cnt is not None
+                        else "🧠 Index starting…")
+                if when:
+                    line += f" · synced {when}"
+            self._mi_rag.setTitle_(line)
+            self._mi_rag.setHidden_(False)
+            self._mi_reindex.setHidden_(False)
+        else:
+            self._mi_rag.setHidden_(True)
+            self._mi_reindex.setHidden_(True)
+
         # "Launch at Login" checkmark reflects whether the LaunchAgent is installed.
         self._mi_login.setState_(
             NSControlStateValueOn if launchagent.is_installed() else NSControlStateValueOff
@@ -924,6 +1127,24 @@ class DocToPDFController(NSObject):
             subprocess.run(["open", str(path)], check=False)
         except Exception as exc:  # noqa: BLE001
             self._alert("Couldn't open history", str(exc))
+
+    def onRebuildIndex_(self, _sender) -> None:
+        if self._rag is None:
+            return
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Rebuild knowledge index?")
+        alert.setInformativeText_("Clears the vector store and re-embeds every "
+                                  "watched source on the next cycle. Use this after "
+                                  "changing the embedder model.")
+        alert.addButtonWithTitle_("Rebuild")
+        alert.addButtonWithTitle_("Cancel")
+        if alert.runModal() != NSAlertFirstButtonReturn:
+            return
+        # Route through the RAG worker so it's serialized with syncs/deletes
+        # (no concurrent collection mutation).
+        self._rag_set_note("Rebuilding index…")
+        self._rag_q.put(("reindex", None, None, None, None, None))
 
     def onPreferences_(self, _sender) -> None:
         self._prefs = prefs.PreferencesController.alloc().initWithApp_(self)

@@ -86,7 +86,35 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Record every change to the audit log (Change history dashboard). Requires a
     # text snapshot to diff, so this also enables text capture for plain setups.
     "audit_log": True,
+    # --- RAG / vector sync -----------------------------------------------
+    # A continuously-synced, change-aware local vector store over every watched
+    # source, queryable by CLI and an MCP server. Embeddings are local by
+    # default (Ollama) so content never leaves the machine. The store directory
+    # is a local artifact (gitignored), separate from the git audit trail.
+    "rag": {
+        "enabled": True,
+        "store_path": "~/Documents/DocExports/.vectorstore",
+        "embedder": {
+            "provider": "ollama",            # ollama | openai
+            "model": "nomic-embed-text",
+            "url": "http://localhost:11434",
+            # "api_key": null,               # openai only; falls back to $OPENAI_API_KEY
+        },
+        "chunk": {"size": 1000, "overlap": 150},
+        "mcp": {"enabled": True},
+    },
 }
+
+
+def _deep_fill(value: Any, default: Any) -> Any:
+    """Recursively backfill missing keys in a nested-dict config value from its
+    default, so adding a sub-key (e.g. ``rag.mcp``) doesn't get dropped when an
+    older stored config supplies only part of the object."""
+    if isinstance(default, dict):
+        if not isinstance(value, dict):
+            return dict(default)
+        return {k: _deep_fill(value.get(k, default[k]), default[k]) for k in default}
+    return value
 
 
 def load_config() -> dict[str, Any]:
@@ -102,6 +130,11 @@ def load_config() -> dict[str, Any]:
         # defaults. (json.JSONDecodeError and UnicodeDecodeError are both
         # ValueError; FileNotFoundError/permission errors are OSError.)
         pass
+    # Backfill nested-dict sections (e.g. ``rag``) so partial stored objects keep
+    # the defaults for any sub-keys they omit.
+    for key, dval in DEFAULT_CONFIG.items():
+        if isinstance(dval, dict):
+            config[key] = _deep_fill(config.get(key), dval)
     return config
 
 
