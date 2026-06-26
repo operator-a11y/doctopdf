@@ -85,6 +85,7 @@ Google authorization. Then:
 | **Recent exports ▸** | The last 15 exports; click any to open it. |
 | **Pause / Resume** | Stop/start the watch loop. |
 | **Add Doc or Folder…** | Add a doc, sheet, slides, or folder to the watch list. |
+| **Preferences…** | A window to adjust all settings (no JSON editing needed). |
 | **Launch at Login** | Toggle auto-start at login (✓ when on). |
 | **Quit** | Exit the app. |
 
@@ -143,7 +144,9 @@ list "just works":
 }
 ```
 
-Edit the file while the app is closed, then relaunch to pick up changes.
+Most of these can be set from the **Preferences…** menu item (a window) — no
+JSON editing needed; changes apply live. Editing the file directly also works
+(relaunch to pick up changes).
 
 ### Export more
 
@@ -255,6 +258,7 @@ doctopdf/
   drive.py       # Google auth + Drive get/list/export helpers
   pipeline.py    # export pipeline: type-aware formats, output modes, git history, hook
   summarize.py   # local-model (Ollama) AI change summaries
+  prefs.py       # native Preferences window
   launchagent.py # install/remove the launch-at-login LaunchAgent
   config.py      # config load/save + token/config paths
 requirements.txt

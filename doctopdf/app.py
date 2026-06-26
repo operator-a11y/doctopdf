@@ -43,7 +43,7 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSObject
 
-from . import config, drive, launchagent, pipeline, summarize
+from . import config, drive, launchagent, pipeline, prefs, summarize
 from .drive import AuthFlowError, DriveError, ReauthRequired
 from .pipeline import sanitize_filename  # re-exported for convenience
 
@@ -124,6 +124,7 @@ class DocToPDFController(NSObject):
         self._worker = threading.Thread(target=self._run_worker, name="watch", daemon=True)
 
         self._cur_title = None
+        self._prefs = None                  # retained Preferences window controller
         self._build_status_item()
 
         self._worker.start()
@@ -185,6 +186,7 @@ class DocToPDFController(NSObject):
         menu.addItem_(NSMenuItem.separatorItem())
         self._mi_pause = action("Pause", "onTogglePause:")
         action("Add Doc or Folder…", "onAddTarget:")
+        action("Preferences…", "onPreferences:")
         self._mi_login = action("Launch at Login", "onToggleLogin:")
         menu.addItem_(NSMenuItem.separatorItem())
         action("Quit", "onQuit:")
@@ -637,6 +639,25 @@ class DocToPDFController(NSObject):
             subprocess.run(["open", str(path)], check=False)
         else:
             self._alert("File missing", "That export no longer exists on disk.")
+
+    def onPreferences_(self, _sender) -> None:
+        self._prefs = prefs.PreferencesController.alloc().initWithApp_(self)
+        self._prefs.show()
+
+    @objc.python_method
+    def apply_prefs(self, cfg: dict) -> None:
+        """Persist + apply preferences live (most settings the worker reads each
+        poll; poll_interval needs the base interval updated)."""
+        with self._lock:
+            self._config.update(cfg)
+            try:
+                self._base_interval = max(MIN_INTERVAL, int(cfg.get("poll_interval", 10)))
+            except (TypeError, ValueError):
+                pass
+            self._interval = self._base_interval
+            self._force = True  # re-export so new formats/outputs take effect now
+        config.save_config(self._config)
+        self._wake.set()
 
     def onToggleLogin_(self, _sender) -> None:
         try:
