@@ -83,6 +83,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Scheduled digest: a ranked rollup of changes. off | daily | weekly.
     "digest": "off",
     "digest_hour": 9,              # local hour (0–23) to send the digest
+    # Record every change to the audit log (Change history dashboard). Requires a
+    # text snapshot to diff, so this also enables text capture for plain setups.
+    "audit_log": True,
 }
 
 

@@ -64,9 +64,12 @@ document.querySelectorAll('th[data-k]').forEach((th, i) => th.addEventListener('
 
 
 def build_report(events: list, generated: str) -> str:
+    # Bucket every event into a known severity so the header totals always sum
+    # to len(events) — an off-list severity falls back to "substantive".
     counts = {"material": 0, "substantive": 0, "cosmetic": 0}
     for e in events:
-        counts[e.get("severity") or "substantive"] = counts.get(e.get("severity") or "substantive", 0) + 1
+        sev = e.get("severity")
+        counts[sev if sev in counts else "substantive"] += 1
     events = sorted(events, key=lambda e: e.get("time") or "", reverse=True)
 
     def esc(v):

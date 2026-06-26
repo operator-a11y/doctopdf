@@ -101,6 +101,7 @@ class DocToPDFController(NSObject):
         self._modified: dict = {}           # file id -> last seen Drive modifiedTime
         self._prev_text: dict = {}          # target id/url -> last snapshot text (for diffs)
         self._inflight: set = set()         # doc names with a change being processed
+        self._pending: dict = {}            # doc name -> latest (old,new,cfg,who) queued mid-flight
         self._web_next: dict = {}           # web url -> monotonic time of next poll
         self._web_backoff: dict = {}        # web url -> current backoff seconds (bot-block)
         self._entry_names: dict = {}        # watch-entry id -> menu label
@@ -132,6 +133,17 @@ class DocToPDFController(NSObject):
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._worker = threading.Thread(target=self._run_worker, name="watch", daemon=True)
+
+        # If digests are already enabled in the loaded config but no digest has
+        # ever been delivered, seed the baseline now — events accumulate
+        # continuously for the audit log, so an un-seeded first digest would
+        # dump the whole retained backlog. (The live off->on path is seeded in
+        # apply_prefs; this covers a config that loads already-on.)
+        if (self._config.get("digest") or "off").lower() in ("daily", "weekly"):
+            try:
+                digest.seed_if_unset(datetime.now())
+            except Exception:  # noqa: BLE001 — best-effort seed
+                pass
 
         self._cur_title = None
         self._prefs = None                  # retained Preferences window controller
@@ -593,76 +605,97 @@ class DocToPDFController(NSObject):
 
     @objc.python_method
     def _handle_change(self, name, old_text, new_text, cfg, who=None) -> None:
-        """Classify a change, gate it by severity, then surface + alert + log.
+        """Classify a change, record it, then surface + alert above threshold.
 
         Runs on a daemon thread (local model + webhooks/email are network I/O);
         never blocks the watch loop. Coalesces per doc so a fast series of edits
-        can't pile up overlapping model/alert threads.
+        can't pile up overlapping model/alert threads — but the latest pending
+        change is *queued*, not dropped, so its diff (and 'who') is never lost.
         """
         with self._lock:
             if name in self._inflight:
-                return  # a change for this doc is already being processed
+                self._pending[name] = (old_text, new_text, cfg, who)
+                return  # a change for this doc is mid-flight; re-processed on finish
             self._inflight.add(name)
 
-        def go():
+        def go(o, n, c, w):
             try:
-                summary = severity = category = None
-                degraded = False
-                if cfg.get("ai_summary"):
-                    cls = summarize.classify_change(old_text, new_text, cfg)
-                    if cls:
-                        summary, severity, category = cls["summary"], cls["severity"], cls["category"]
-                    else:
-                        # Model enabled but unreachable/failed. We can't classify,
-                        # so we must NOT go silent (that hides real changes from a
-                        # user relying on alerts). Fail open: 'substantive' for
-                        # external gating, and always surface locally + warn.
-                        severity, degraded = "substantive", True
-
-                # A model outage is always surfaced locally + on the warning line,
-                # regardless of threshold — otherwise a raised threshold + outage =
-                # total silence on changes that might be material.
-                if degraded:
-                    self._notify(f"{name} — changed",
-                                 "Local model offline — couldn't classify this change.")
+                while True:
+                    self._process_change(name, o, n, c, w)
                     with self._lock:
-                        self._state["alert_warning"] = "Local model unavailable — change not classified."
-
-                passed = alerts.passes(severity, cfg.get("min_severity"))
-                warns = []
-                if passed:
-                    now = datetime.now()
-                    event = {"time": now.isoformat(timespec="seconds"), "doc": name,
-                             "summary": summary, "severity": severity, "category": category,
-                             "who": who}
-                    # The change notification (the plain export one was suppressed).
-                    if cfg.get("ai_summary") and not degraded:
-                        self._notify(f"{name} — {severity}", summary or "Document changed.")
-                        if summary:
-                            with self._lock:
-                                self._state["last_summary"] = f"{name}: [{severity}] {summary}"
-                    if alerts.any_destination(cfg):
-                        tag = f" [{severity}]" if severity else ""
-                        warns = alerts.dispatch(cfg, f"DocToPDF: {name} changed{tag}",
-                                                summary or "Document changed.")
-                    # Always log to the change-event audit trail (the digest and the
-                    # Change-history dashboard both read it).
-                    try:
-                        digest.append(event, now)
-                    except Exception:  # noqa: BLE001 — logging is best-effort
-                        pass
-
-                # Clear/refresh the warning line on a clean (non-degraded) result.
-                if not degraded:
-                    note = (warns[0] if len(warns) == 1 else
-                            f"{len(warns)} alert issues (e.g. {warns[0]})") if warns else None
-                    with self._lock:
-                        self._state["alert_warning"] = note
-            finally:
+                        nxt = self._pending.pop(name, None)
+                        if nxt is None:
+                            self._inflight.discard(name)
+                            return
+                    o, n, c, w = nxt  # drain the change that arrived mid-flight
+            except BaseException:
                 with self._lock:
+                    self._pending.pop(name, None)
                     self._inflight.discard(name)
+                raise
 
-        threading.Thread(target=go, name="doctopdf-change", daemon=True).start()
+        threading.Thread(target=go, args=(old_text, new_text, cfg, who),
+                         name="doctopdf-change", daemon=True).start()
+
+    @objc.python_method
+    def _process_change(self, name, old_text, new_text, cfg, who) -> None:
+        """Classify one change, log it to the audit trail, and alert if it passes
+        the severity threshold. Synchronous; called from the change worker."""
+        summary = severity = category = None
+        degraded = False
+        if cfg.get("ai_summary"):
+            cls = summarize.classify_change(old_text, new_text, cfg)
+            if cls:
+                summary, severity, category = cls["summary"], cls["severity"], cls["category"]
+            else:
+                # Model enabled but unreachable/failed. We can't classify, so we
+                # must NOT go silent (that hides real changes from a user relying
+                # on alerts). Fail open: 'substantive' for external gating, and
+                # always surface locally + warn.
+                severity, degraded = "substantive", True
+
+        # A model outage is always surfaced locally + on the warning line,
+        # regardless of threshold — otherwise a raised threshold + outage = total
+        # silence on changes that might be material.
+        if degraded:
+            self._notify(f"{name} — changed",
+                         "Local model offline — couldn't classify this change.")
+            with self._lock:
+                self._state["alert_warning"] = "Local model unavailable — change not classified."
+
+        now = datetime.now()
+        event = {"time": now.isoformat(timespec="seconds"), "doc": name,
+                 "summary": summary, "severity": severity, "category": category,
+                 "who": who}
+        # The audit trail records EVERY detected change, regardless of the alert
+        # threshold — the Change-history dashboard is the full compliance record;
+        # min_severity only gates who gets *alerted* (below). A degraded change is
+        # logged too, so an outage never leaves a hole in the trail.
+        try:
+            digest.append(event, now)
+        except Exception:  # noqa: BLE001 — logging is best-effort
+            pass
+
+        passed = alerts.passes(severity, cfg.get("min_severity"))
+        warns = []
+        if passed:
+            # The change notification (the plain export one was suppressed).
+            if cfg.get("ai_summary") and not degraded:
+                self._notify(f"{name} — {severity}", summary or "Document changed.")
+                if summary:
+                    with self._lock:
+                        self._state["last_summary"] = f"{name}: [{severity}] {summary}"
+            if alerts.any_destination(cfg):
+                tag = f" [{severity}]" if severity else ""
+                warns = alerts.dispatch(cfg, f"DocToPDF: {name} changed{tag}",
+                                        summary or "Document changed.")
+
+        # Clear/refresh the warning line on a clean (non-degraded) result.
+        if not degraded:
+            note = (warns[0] if len(warns) == 1 else
+                    f"{len(warns)} alert issues (e.g. {warns[0]})") if warns else None
+            with self._lock:
+                self._state["alert_warning"] = note
 
     # ----------------------------------------------------------- UI refresh
     def refreshUI_(self, _timer) -> None:
@@ -865,7 +898,12 @@ class DocToPDFController(NSObject):
         now = datetime.now()
         if not digest.due(cfg, now):
             return
-        events = digest.peek_since(now)        # read without marking yet
+        # The audit log records every change; the digest stays a curated rollup,
+        # so apply the same severity threshold the real-time alerts use. (The
+        # full record lives in the Change-history dashboard.)
+        threshold = cfg.get("min_severity")
+        events = [e for e in digest.peek_since(now)         # read without marking yet
+                  if alerts.passes(e.get("severity"), threshold)]
         period = cfg.get("digest")
 
         def go():
@@ -901,6 +939,17 @@ class DocToPDFController(NSObject):
         out_keys = ("formats", "output_dir", "timestamped", "keep_versions",
                     "git_repo", "git_snapshot_text")
         changed = any(self._config.get(k) != cfg.get(k) for k in out_keys)
+        # Switching digests on: seed the baseline to now so the *first* digest
+        # covers only changes from here forward. Events accumulate continuously
+        # (for the audit log), so without this the first digest would dump the
+        # entire retained backlog (up to 90 days).
+        was_off = (self._config.get("digest") or "off").lower() not in ("daily", "weekly")
+        now_on = (cfg.get("digest") or "off").lower() in ("daily", "weekly")
+        if was_off and now_on:
+            try:
+                digest.mark_sent(datetime.now())
+            except Exception:  # noqa: BLE001 — best-effort seed
+                pass
         with self._lock:
             self._config.update(cfg)
             try:

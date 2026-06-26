@@ -1,10 +1,10 @@
 """Change-event log + scheduled digests for DocToPDF.
 
-Every change that passes the severity threshold is appended to a small JSON log
-(``~/Library/Application Support/DocToPDF/events.json``). A daily/weekly digest
-compiles the events since the last digest, ranked by severity, into a rollup.
-
-The log doubles as the data for a future audit view. Stdlib only.
+Every detected change is appended to a small JSON log
+(``~/Library/Application Support/DocToPDF/events.json``) — this is the full
+audit trail the Change-history dashboard reads. A daily/weekly digest compiles
+the events since the last digest, ranked by severity, into a rollup (the caller
+applies the alert threshold so the digest stays curated). Stdlib only.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def _parse(ts: Optional[str]) -> Optional[datetime]:
 
 
 def append(event: dict, now: datetime) -> None:
-    """Append a change event (``{time, doc, summary, severity, category}``)."""
+    """Append a change event (``{time, doc, summary, severity, category, who}``)."""
     with _LOCK:
         data = _load()
         data["events"].append(event)
@@ -107,6 +107,19 @@ def mark_sent(now: datetime) -> None:
         data = _load()
         data["last_digest"] = now.isoformat(timespec="seconds")
         _save(data)
+
+
+def seed_if_unset(now: datetime) -> bool:
+    """Seed the digest baseline to ``now`` iff none is set yet. Returns True if it
+    seeded. Used when digests turn on so the first digest covers only changes from
+    here forward (events accumulate continuously for the audit log). Atomic."""
+    with _LOCK:
+        data = _load()
+        if data.get("last_digest"):
+            return False
+        data["last_digest"] = now.isoformat(timespec="seconds")
+        _save(data)
+        return True
 
 
 def build_text(events: list[dict], period: str) -> str:

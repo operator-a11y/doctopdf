@@ -204,11 +204,11 @@ def _call(fn: Callable, file_id: str):
 
 
 def get_file_metadata(service, file_id: str) -> dict:
-    """Return ``{id, name, modifiedTime, mimeType, lastModifyingUser}`` for the file."""
+    """Return ``{id, name, modifiedTime, mimeType, lastModifyingUser(displayName)}``."""
     return _call(
         lambda: service.files()
         .get(fileId=file_id,
-             fields="id, name, modifiedTime, mimeType, lastModifyingUser(displayName, emailAddress)")
+             fields="id, name, modifiedTime, mimeType, lastModifyingUser(displayName)")
         .execute(),
         file_id,
     )
@@ -217,7 +217,8 @@ def get_file_metadata(service, file_id: str) -> dict:
 def list_folder(service, folder_id: str) -> list[dict]:
     """List non-trashed files directly in a folder.
 
-    Returns ``[{id, name, modifiedTime, mimeType}, …]`` across all pages.
+    Returns ``[{id, name, modifiedTime, mimeType, lastModifyingUser(displayName)}, …]``
+    across all pages.
     """
     def _fetch():
         items, token = [], None

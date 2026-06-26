@@ -301,13 +301,17 @@ def run_export(cfg: dict, service, file_id: str, name: str, gtype: str = "docume
 
     # Decide every format we must export: the requested outputs, plus a text
     # format (valid for this type) so git history, AI summaries, and change
-    # detection (for alerts/digests) have real text to diff.
+    # detection (for alerts/digests) have real text to diff. The audit log
+    # (Change history dashboard) is always present, so by default we always
+    # capture text — otherwise a plain PDF-only setup records nothing to diff
+    # and the dashboard stays permanently empty.
     want_text = bool(
         (git_repo and cfg.get("git_snapshot_text", True))
         or cfg.get("ai_summary")
         or cfg.get("webhook_urls")
         or cfg.get("email_to")
         or (cfg.get("digest", "off") not in (None, "off"))
+        or cfg.get("audit_log", True)
     )
     needed = list(formats)
     if want_text and not any(f in TEXT_FORMATS for f in needed):
