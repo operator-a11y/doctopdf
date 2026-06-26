@@ -50,6 +50,23 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(publish.target_key(a), publish.target_key(dict(a)))
         self.assertNotEqual(publish.target_key(a), publish.target_key({**a, "branch": "z"}))
 
+    def test_image_only_doc_skips_not_blank(self):
+        # A doc that's only an image renders an empty body — must skip, not publish
+        # a blank page over a live one.
+        with self.assertRaises(publish.PublishSkip):
+            publish.publish({"type": "git_pages", "repo": "r", "branch": "b"},
+                            "Doc", "![pic](http://x/i.png)")
+
+    def test_image_count_covers_html_and_markdown(self):
+        _, warn = publish.build_page("# T\n\n![a](u)\n\n<img src='b'>\n\ntext", "T", "default")
+        self.assertIn("2 image", warn)        # both the markdown image and the raw <img>
+
+    def test_template_injection_via_title_is_inert(self):
+        # A doc titled like a marker must not inject the body into <title>/<h1>.
+        page, _ = publish.build_page("# heading\n\nBODYTEXT", "{{content}}", "default")
+        self.assertNotIn("BODYTEXT</title>", page)
+        self.assertIn("{{content}}", page)    # the literal title, escaped, stays put
+
 
 # ---------------------------------------------------------------------------
 # Safe git push (local bare repo as the "remote")
@@ -87,17 +104,23 @@ class SafeGitPushTests(unittest.TestCase):
         self.assertTrue(c2 and c2 != c1)
         self.assertEqual(self._clone_remote("v2", ).joinpath("index.html").read_bytes(), b"y")
 
-    def test_force_with_lease_recovers_nonfastforward(self):
-        publish.git_publish(str(self.remote), "gh-pages", {"index.html": b"x"}, "a")
-        # Someone else pushes to the app-owned branch underneath us.
+    def test_diverged_remote_rebases_without_clobbering(self):
+        publish.git_publish(str(self.remote), "gh-pages", {"other.txt": b"x"}, "a")
+        # Someone else commits a DIFFERENT file to the app branch underneath us.
         other = self._clone_remote("other")
-        (other / "index.html").write_text("external")
+        (other / "external.txt").write_text("external work")
+        _git(other, "add", "-A")
         _git(other, "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-qam", "ext")
         _git(other, "push", "-q", "origin", "gh-pages")
-        # Our next publish must still land (fetch + --force-with-lease on our branch).
+        # Our next publish must land our file AND preserve their commit (rebase, not
+        # a force that silently discards it).
         c = publish.git_publish(str(self.remote), "gh-pages", {"index.html": b"ours"}, "b")
         self.assertTrue(c)
-        self.assertEqual(self._clone_remote("v3").joinpath("index.html").read_bytes(), b"ours")
+        v = self._clone_remote("v3")
+        self.assertEqual((v / "index.html").read_bytes(), b"ours")
+        self.assertTrue((v / "external.txt").is_file())          # their work survives
+        log = _git(v, "log", "--oneline").stdout
+        self.assertIn("ext", log)                                # their commit is in history
 
     def test_empty_snapshot_raises_skip(self):
         with self.assertRaises(publish.PublishSkip):

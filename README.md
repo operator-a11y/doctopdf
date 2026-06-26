@@ -387,9 +387,11 @@ failures surface in the menu (⚠️) and retry with backoff; nothing is silentl
 dropped.
 
 **Safe git.** DocToPDF maintains its own working copy under app data and only
-ever writes the **dedicated branch** you name — it pull-rebases before pushing
-and uses `--force-with-lease` *only on that app-owned branch*, never your `main`.
-Point `branch` at a branch you've reserved for publishing (e.g. `gh-pages`).
+ever writes the **dedicated branch** you name — never your `main`. It pull-rebases
+before pushing, and if the branch moved under it, it rebases its single
+regenerated commit onto the new tip and pushes normally (no force) — so a
+concurrent push to that branch is preserved, not clobbered. Point `branch` at a
+branch you've reserved for publishing (e.g. `gh-pages`).
 
 **Approval.** `auto` publishes on every stable change. `manual` holds the change
 as **pending** and notifies *"Site has pending changes — review & publish"*;

@@ -112,7 +112,8 @@ class DocToPDFController(NSObject):
         self._pending: dict = {}            # doc name -> latest (old,new,cfg,who) queued mid-flight
         self._web_next: dict = {}           # web url -> monotonic time of next poll
         self._web_backoff: dict = {}        # web url -> current backoff seconds (bot-block)
-        self._entry_names: dict = {}        # watch-entry id -> menu label
+        self._entry_names: dict = {}        # watch-entry id -> menu label (decorated)
+        self._source_names: dict = {}       # target id -> clean display name (for publish)
         self._watch_sig = None              # last-rendered watch submenu signature
         self._interval = self._base_interval
         self._paused = False
@@ -504,6 +505,9 @@ class DocToPDFController(NSObject):
 
         with self._lock:
             self._entry_names = entry_names
+            # Clean (un-decorated) names, so a manual Publish-now/retry titles the
+            # page the same way an auto publish (which uses the poll's name) does.
+            self._source_names = {t["id"]: t["name"] for t in targets}
         return targets, errors
 
     @objc.python_method
@@ -884,6 +888,8 @@ class DocToPDFController(NSObject):
                 continue
             try:
                 self._pub_run(task)
+            except Exception:  # noqa: BLE001 — a task must never kill the worker
+                pass
             finally:
                 self._pub_q.task_done()
 
@@ -948,13 +954,20 @@ class DocToPDFController(NSObject):
 
     @objc.python_method
     def _pub_retry_due(self) -> None:
-        """Re-run failed publishes whose backoff has elapsed (push recovered)."""
+        """Re-run failed publishes whose backoff has elapsed (push recovered).
+        Drops retries for targets that have since been removed from config."""
         if not self._pub_retry:
             return
+        with self._lock:
+            live = {publish.target_key(t) for t in (self._config.get("publish") or [])}
         now = time.monotonic()
         for key, (task, due) in list(self._pub_retry.items()):
             if self._stop.is_set():
                 return
+            if key not in live:
+                self._pub_retry.pop(key, None)        # target removed — stop retrying
+                self._pub_backoff.pop(key, None)
+                continue
             if now >= due:
                 self._pub_retry.pop(key, None)
                 self._pub_run(task)
@@ -979,7 +992,7 @@ class DocToPDFController(NSObject):
         with self._lock:
             pubs = list(self._config.get("publish") or [])
             snaps = dict(self._prev_text)
-            names = dict(self._entry_names)
+            names = dict(self._source_names)
         for t in pubs:
             sid = t.get("source_id")
             md = snaps.get(sid)
@@ -1384,7 +1397,7 @@ class DocToPDFController(NSObject):
             target = next((t for t in (self._config.get("publish") or [])
                            if publish.target_key(t) == key), None)
             snaps = dict(self._prev_text)
-            names = dict(self._entry_names)
+            names = dict(self._source_names)
         if target:
             sid = target.get("source_id")
             if snaps.get(sid):
@@ -1435,6 +1448,7 @@ class DocToPDFController(NSObject):
         # (auto → live, manual → pending), so binding takes effect without waiting
         # for the next edit.
         old_keys = {publish.target_key(t) for t in (self._config.get("publish") or [])}
+        live_keys = {publish.target_key(t) for t in (cfg.get("publish") or [])}
         new_targets = [t for t in (cfg.get("publish") or [])
                        if publish.target_key(t) not in old_keys]
         with self._lock:
@@ -1447,7 +1461,13 @@ class DocToPDFController(NSObject):
             if changed:
                 self._force = True  # re-export so new formats/outputs take effect now
             snaps = dict(self._prev_text)
-            names = dict(self._entry_names)
+            names = dict(self._source_names)
+            # Drop status/pending for removed targets so no stale menu line lingers.
+            # (_pub_retry/_pub_backoff are worker-owned; the worker drops removed
+            # targets in _pub_retry_due, avoiding a cross-thread mutation here.)
+            for d in (self._pub_status, self._pub_pending):
+                for k in [k for k in d if k not in live_keys]:
+                    d.pop(k, None)
         for t in new_targets:
             sid = t.get("source_id")
             if snaps.get(sid):

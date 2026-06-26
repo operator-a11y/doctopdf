@@ -36,7 +36,8 @@ from . import config
 
 PUBLISH_DIR = config.APP_SUPPORT_DIR / "publish"     # app-owned git working copies
 THEMES_DIR = Path(__file__).resolve().parent / "themes"
-GIT_TIMEOUT = 120                                    # seconds per git invocation
+GIT_TIMEOUT = 45     # seconds per git invocation — bound a hung/black-holing remote
+                     # so one bad target can't stall the single publish worker for long
 
 # Sanitizer allowlist = nh3 defaults minus <img>: images can't be resolved on the
 # published host yet (see strip_images), so we drop them rather than emit broken
@@ -104,25 +105,35 @@ def load_template(template: Optional[str]) -> str:
     return (THEMES_DIR / "default.html").read_text(encoding="utf-8")
 
 
+_MARKER_RE = re.compile(r"\{\{\s*(title|content)\s*\}\}")
+
+
 def apply_template(template_html: str, title: str, content_html: str) -> str:
-    """Substitute ``{{ title }}`` / ``{{ content }}`` (with or without spaces).
+    """Substitute ``{{ title }}`` / ``{{ content }}`` (with or without spaces) in a
+    SINGLE pass, so a substituted value that itself looks like a marker (e.g. a doc
+    titled ``{{content}}``) can't inject the other field.
 
     The title is HTML-escaped (it lands in <title>/<h1>); the content is already
     sanitized HTML and is inserted verbatim.
     """
-    safe_title = html_mod.escape(title or "Untitled")
-    out = template_html
-    for marker in ("{{ title }}", "{{title}}"):
-        out = out.replace(marker, safe_title)
-    for marker in ("{{ content }}", "{{content}}"):
-        out = out.replace(marker, content_html)
-    return out
+    repl = {"title": html_mod.escape(title or "Untitled"), "content": content_html}
+    return _MARKER_RE.sub(lambda m: repl[m.group(1)], template_html)
 
 
 def build_page(md_text: str, title: str, template: Optional[str]) -> tuple:
-    """Full Doc-Markdown → published HTML page. Returns ``(html, image_warning)``."""
-    stripped, n_imgs = strip_images(md_text)
-    content = sanitize_html(render_markdown(stripped))
+    """Full Doc-Markdown → published HTML page. Returns ``(html, image_warning)``.
+
+    Raises :class:`PublishSkip` if the rendered body is empty (e.g. a doc that's
+    only images/HTML) so we never overwrite a live page with a blank one — the
+    raw-text guard in :func:`publish` can't catch this since the input is
+    non-empty before stripping.
+    """
+    # Count every image that won't survive — markdown images, reference-style, and
+    # raw HTML <img> — by counting <img> in the full render (nh3 drops them all).
+    n_imgs = render_markdown(md_text or "").count("<img")
+    content = sanitize_html(render_markdown(strip_images(md_text)[0]))
+    if not content.strip():
+        raise PublishSkip("rendered content is empty — nothing to publish")
     page = apply_template(load_template(template), title, content)
     warn = (f"{n_imgs} image(s) not published (images aren't supported yet)"
             if n_imgs else None)
@@ -164,8 +175,9 @@ def _checkout_branch(workdir: Path, branch: str) -> None:
     inherit the default branch's history/files)."""
     _git(workdir, "fetch", "origin", branch, check=False)
     if _git(workdir, "rev-parse", "--verify", f"origin/{branch}", check=False).returncode == 0:
-        if _git(workdir, "checkout", "-B", branch, f"origin/{branch}", check=False).returncode != 0:
-            raise _fail("checkout", _git(workdir, "checkout", "-B", branch, f"origin/{branch}", check=False))
+        res = _git(workdir, "checkout", "-B", branch, f"origin/{branch}", check=False)
+        if res.returncode != 0:
+            raise _fail("checkout", res)
     elif _git(workdir, "rev-parse", "--verify", branch, check=False).returncode == 0:
         _git(workdir, "checkout", branch)
     else:
@@ -195,13 +207,19 @@ def _ensure_clone(workdir: Path, repo: str, branch: str) -> None:
 
 
 def _push(workdir: Path, branch: str) -> None:
-    """Push the app-owned branch. On rejection (it moved), re-fetch and
-    ``--force-with-lease`` — only ever on this branch, never the user's main."""
+    """Push the app-owned branch. On rejection (the remote branch moved under us),
+    rebase our single regenerated commit ONTO the new tip and push normally —
+    never force. (A bare ``--force-with-lease`` here is unsafe: the fetch it needs
+    would refresh the lease ref and silently clobber the other commit.) On a real
+    conflict, abort and surface it so the next publish re-syncs and retries."""
     res = _git(workdir, "push", "origin", branch, check=False)
     if res.returncode == 0:
         return
-    _git(workdir, "fetch", "origin", branch, check=False)
-    res2 = _git(workdir, "push", "--force-with-lease", "origin", branch, check=False)
+    reb = _git(workdir, "pull", "--rebase", "origin", branch, check=False)
+    if reb.returncode != 0:
+        _git(workdir, "rebase", "--abort", check=False)   # leave a clean tree for the retry
+        raise _fail("push (branch diverged — will retry)", res)
+    res2 = _git(workdir, "push", "origin", branch, check=False)
     if res2.returncode != 0:
         raise _fail("push", res2)
 
