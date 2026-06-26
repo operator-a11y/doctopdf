@@ -44,7 +44,7 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSObject
 
-from . import alerts, config, digest, drive, launchagent, pipeline, prefs, summarize
+from . import alerts, config, digest, drive, launchagent, pipeline, prefs, summarize, web
 from .drive import AuthFlowError, DriveError, ReauthRequired
 from .pipeline import sanitize_filename  # re-exported for convenience
 
@@ -61,6 +61,9 @@ GLYPH_PAUSED = "⏸ "
 
 MIN_INTERVAL = 3      # never poll faster than this, whatever the config says
 MAX_INTERVAL = 60     # backoff ceiling
+WEB_DEFAULT_INTERVAL = 600   # web targets poll far slower than docs — be polite
+WEB_MIN_INTERVAL = 60        # floor for a web poll interval
+WEB_BACKOFF_CAP = 3600       # max backoff for a bot-blocked site (1h)
 
 
 class DocToPDFController(NSObject):
@@ -94,8 +97,10 @@ class DocToPDFController(NSObject):
             self._config["watch"] = self._watch
             config.save_config(self._config)
         self._modified: dict = {}           # file id -> last seen Drive modifiedTime
-        self._prev_text: dict = {}          # file id -> last exported text (for AI diffs)
+        self._prev_text: dict = {}          # target id/url -> last snapshot text (for diffs)
         self._inflight: set = set()         # doc names with a change being processed
+        self._web_next: dict = {}           # web url -> monotonic time of next poll
+        self._web_backoff: dict = {}        # web url -> current backoff seconds (bot-block)
         self._entry_names: dict = {}        # watch-entry id -> menu label
         self._watch_sig = None              # last-rendered watch submenu signature
         self._interval = self._base_interval
@@ -340,10 +345,31 @@ class DocToPDFController(NSObject):
             if fid in seen:
                 return
             seen.add(fid)
-            targets.append({"id": fid, "name": name or fid, "modified": modified,
-                            "gtype": gtype, "overrides": overrides})
+            targets.append({"kind": "drive", "id": fid, "name": name or fid,
+                            "modified": modified, "gtype": gtype, "overrides": overrides})
 
         for entry in watch:
+            # Web target — no Drive call; the change signal is the content hash.
+            if entry.get("kind") == "web":
+                url = entry.get("url")
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                wname = entry.get("name") or url
+                overrides = {k: entry[k] for k in ("output_dir", "formats") if k in entry}
+                if entry.get("severity_min"):
+                    overrides["min_severity"] = entry["severity_min"]
+                targets.append({
+                    "kind": "web", "id": url, "name": wname, "url": url,
+                    "render": (entry.get("render") or "static"),
+                    "selector": entry.get("selector"),
+                    "mode": (entry.get("mode") or "text"),
+                    "poll_seconds": entry.get("poll_seconds", WEB_DEFAULT_INTERVAL),
+                    "overrides": overrides,
+                })
+                entry_names[url] = f"🌐 {wname}"
+                continue
+
             fid = entry.get("id")
             if not fid:
                 continue
@@ -401,7 +427,10 @@ class DocToPDFController(NSObject):
                     completed = False
                     break
             try:
-                warning = self._poll_file(t, force)
+                if t.get("kind") == "web":
+                    warning = self._poll_web(t, force)   # never raises; self-backs-off
+                else:
+                    warning = self._poll_file(t, force)
                 if warning:
                     notes.append(warning)
             except ReauthRequired:
@@ -411,12 +440,13 @@ class DocToPDFController(NSObject):
 
         live = {t["id"] for t in targets}
         with self._lock:
-            # Bound _modified to currently-resolved targets, but only on a fully
-            # clean cycle so a transient failure doesn't drop a baseline and
-            # force a redundant re-export next time.
+            # Bound per-target state to currently-resolved targets, but only on a
+            # fully clean cycle so a transient failure doesn't drop a baseline.
             if completed and not notes:
                 self._modified = {k: v for k, v in self._modified.items() if k in live}
                 self._prev_text = {k: v for k, v in self._prev_text.items() if k in live}
+                self._web_next = {k: v for k, v in self._web_next.items() if k in live}
+                self._web_backoff = {k: v for k, v in self._web_backoff.items() if k in live}
             # Only publish batch status on a completed (non-paused) cycle, so a
             # mid-batch pause doesn't leave a partial count/warning.
             if completed:
@@ -470,6 +500,77 @@ class DocToPDFController(NSObject):
         if has_diff:
             self._handle_change(name, old_text, new_text, dict(cfg))
         return result.get("warning")
+
+    @objc.python_method
+    def _poll_web(self, t: dict, force: bool):
+        """Fetch + denoise a web target; on a real content change, hand the diff
+        to the SAME pipeline a Doc change uses. Returns a warning string or None;
+        never raises (web failures self-handle with backoff)."""
+        url, name = t["url"], t["name"]
+        interval = max(WEB_MIN_INTERVAL, int(t.get("poll_seconds") or WEB_DEFAULT_INTERVAL))
+        nowm = time.monotonic()
+        with self._lock:
+            if not force and nowm < self._web_next.get(url, 0.0):
+                return None  # not due yet (web polls far slower than docs)
+
+        self._update_state(kind="exporting")
+        cfg = dict(self._config)
+        cfg.update(t.get("overrides") or {})  # per-target severity/output overrides
+        try:
+            snap = web.snapshot(t)
+        except web.BotBlocked as exc:
+            with self._lock:
+                bo = min(WEB_BACKOFF_CAP, max(interval, self._web_backoff.get(url, interval)) * 2)
+                self._web_backoff[url] = bo
+                self._web_next[url] = nowm + bo
+            return f"{name}: {exc} — backing off"
+        except web.WebError as exc:  # WebSkip (selector empty) included — warn, no diff
+            with self._lock:
+                self._web_next[url] = nowm + interval
+            return f"{name}: {exc}"
+
+        # Success — reset backoff; jitter the next poll so targets stay staggered.
+        with self._lock:
+            self._web_backoff.pop(url, None)
+            self._web_next[url] = nowm + interval + (hash(url) % max(1, interval // 10))
+
+        old = self._prev_text.get(url)
+        changed = old is not None and old != snap
+        if old is None or changed:           # baseline or change → snapshot + commit
+            path = self._write_web_snapshot(name, url, t.get("mode", "text"), snap, cfg)
+            now = time.strftime("%H:%M:%S")
+            with self._lock:
+                self._prev_text[url] = snap
+                self._state["last_export_time"] = now
+                if path:
+                    self._state["last_pdf_path"] = str(path)
+                    self._recent.appendleft({"time": now, "path": str(path), "name": name})
+                    self._recent_dirty = True
+            if changed:
+                if cfg.get("notify") and not cfg.get("ai_summary"):
+                    self._notify(name, "Page changed")
+                self._handle_change(name, old, snap, cfg)  # reuse downstream pipeline
+        return None
+
+    @objc.python_method
+    def _write_web_snapshot(self, name, url, mode, snap, cfg):
+        """Write the cleaned snapshot to the output dir + commit it to git (audit)."""
+        ext = "html" if mode == "html" else "txt"
+        base = pipeline.sanitize_filename(name) or pipeline.sanitize_filename(url) or "page"
+        data = snap.encode("utf-8")
+        path = None
+        try:
+            keep_n = max(0, int(cfg.get("keep_versions", 0) or 0))
+            path = pipeline.write_output(config.resolve_output_dir(cfg), base, ext, data,
+                                         bool(cfg.get("timestamped")), keep_n)
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
+        if cfg.get("git_repo"):
+            try:
+                pipeline.commit_history(cfg["git_repo"], name, {f"{base}.{ext}": data})
+            except Exception:  # noqa: BLE001 — git is best-effort
+                pass
+        return path
 
     @objc.python_method
     def _handle_change(self, name, old_text, new_text, cfg) -> None:
@@ -627,32 +728,54 @@ class DocToPDFController(NSObject):
     def onAddTarget_(self, _sender) -> None:
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         alert = NSAlert.alloc().init()
-        alert.setMessageText_("Add Doc or Folder")
+        alert.setMessageText_("Add Doc, Folder, or Web Page")
         alert.setInformativeText_(
-            "Paste a Google Doc / Sheet / Slides URL or ID — or a Drive folder "
-            "URL/ID to mirror everything in it.")
+            "Paste a Google Doc / Sheet / Slides URL or ID, a Drive folder, or any "
+            "web page URL (https://…) to monitor for changes.")
         alert.addButtonWithTitle_("Add")
         alert.addButtonWithTitle_("Cancel")
-        field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 320, 24))
+        field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 340, 24))
         alert.setAccessoryView_(field)
         alert.window().setInitialFirstResponder_(field)
 
         if alert.runModal() != NSAlertFirstButtonReturn:
             return
-        fid = drive.parse_doc_id(field.stringValue())
-        if not fid:
-            self._alert("Invalid link", "Couldn't find a Google file or folder ID in that text.")
+        text = field.stringValue().strip()
+        entry = self._target_entry_from(text)
+        if entry is None:
+            self._alert("Invalid link", "Paste a Google file/folder URL or ID, or a web page URL.")
             return
+        key = entry.get("url") or entry.get("id")
         with self._lock:
-            if any(e.get("id") == fid for e in self._watch):
+            if any((e.get("url") or e.get("id")) == key for e in self._watch):
                 return  # already watched
-            self._watch.append({"id": fid})
+            self._watch.append(entry)
             self._config["watch"] = list(self._watch)
             self._force = True
             self._auth_blocked = False
             self._interval = self._base_interval
         config.save_config(self._config)
         self._wake.set()
+
+    @objc.python_method
+    def _target_entry_from(self, text):
+        """Turn pasted text into a watch entry: a Google id/URL → Drive entry; a
+        non-Google http(s) URL → web entry. Returns None if neither."""
+        if not text:
+            return None
+        is_url = text.lower().startswith(("http://", "https://"))
+        google = is_url and "google.com" in text.lower()
+        gid = drive.parse_doc_id(text)
+        if gid and (not is_url or google):
+            return {"id": gid}
+        if is_url:
+            from urllib.parse import urlparse
+            p = urlparse(text)
+            nm = (p.netloc + p.path).rstrip("/")[:60] or text
+            return {"kind": "web", "url": text, "name": nm,
+                    "render": "static", "mode": "text",
+                    "poll_seconds": WEB_DEFAULT_INTERVAL}
+        return None
 
     def onRemoveTarget_(self, sender) -> None:
         fid = sender.representedObject()

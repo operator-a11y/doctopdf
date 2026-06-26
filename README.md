@@ -1,9 +1,11 @@
 # DocToPDF
 
-A macOS **menu-bar app** that watches Google **Docs, Sheets, Slides** — or whole
-**Drive folders** — and automatically re-exports them to your Desktop whenever
-they change (polling every ~10 seconds). Edit in Google, and within ~10–20
-seconds a fresh `~/Desktop/<Name>.pdf` (and any other formats you pick) appears.
+A macOS **menu-bar app** that watches Google **Docs, Sheets, Slides** — whole
+**Drive folders** — and **web pages** (competitor pricing, ToS, changelogs), and
+tells you what changed. Google sources re-export to your Desktop on change; web
+pages are fetched, denoised, and diffed. Every change flows through the same
+intelligence layer: classified (cosmetic/substantive/material), severity-filtered,
+routed to Slack/email/webhooks, digested, and committed to a git audit trail.
 
 Also: **multi-format export** (pdf/docx/xlsx/pptx/md/…), **git version history**
 with text diffs, **rolling versions**, a **post-export shell hook**, macOS
@@ -61,6 +63,7 @@ Requires **Python 3.11+** and macOS.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+playwright install chromium      # only needed to monitor JS-rendered web pages
 python -m doctopdf.app
 ```
 
@@ -240,6 +243,38 @@ Then:
 Everything's configurable from the **Change Alerts** tab in Preferences. The
 change log lives at `~/Library/Application Support/DocToPDF/events.json`.
 
+### Monitor web pages
+
+Watch any web page the same way — paste a URL into **Add Doc or Folder…**, or add
+a `web` entry to the watch list. The page is fetched, **denoised** (boilerplate /
+nav / ads / volatile tokens stripped via `trafilatura` or a CSS `selector`), and
+diffed; a real content change flows into the *exact same* pipeline as a Doc change
+(classify → severity → alert → digest → git).
+
+```jsonc
+{
+  "kind": "web",
+  "url": "https://competitor.com/pricing",
+  "name": "Competitor pricing",
+  "render": "static",            // static | browser  (browser = Playwright, for JS pages)
+  "selector": "#pricing-table",  // optional CSS scope — monitor just this region
+  "mode": "text",                // text (robust) | html (catch structural changes)
+  "poll_seconds": 600,           // web polls far slower than docs — be polite
+  "severity_min": "substantive"  // per-target severity threshold (optional)
+}
+```
+
+- **JS pages:** set `"render": "browser"` (needs `playwright install chromium`).
+- **Politeness/safety:** web targets poll on their own higher interval (default
+  10 min, staggered), with a descriptive User-Agent; on `403/429` they **back off**
+  (doubling up to 1 h) and show the error — never tight-looping a blocked site.
+- **No phantom alerts:** if a `selector` stops matching (site redesign), it
+  **warns and skips** instead of reporting a mass deletion; rotating ads /
+  timestamps are denoised away so they don't trigger alerts.
+- **Privacy:** page content is public, and the local-first promise holds — it's
+  summarized locally via Ollama; only the alert/metadata leaves your machine if
+  you route to Slack/email.
+
 ---
 
 ## Behavior & limits
@@ -292,6 +327,7 @@ doctopdf/
   app.py         # native AppKit menu bar: status item, menu, multi-target watch loop
   drive.py       # Google auth + Drive get/list/export helpers
   pipeline.py    # export pipeline: type-aware formats, output modes, git history, hook
+  web.py         # web-page monitoring: fetch (static/Playwright) + extract/denoise
   summarize.py   # local-model (Ollama) change summary + severity/category classify
   alerts.py      # severity gating + Slack/Discord/webhook/email dispatch
   digest.py      # change-event log + scheduled daily/weekly digests
