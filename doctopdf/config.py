@@ -106,6 +106,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "chunk": {"size": 1000, "overlap": 150},
         "mcp": {"enabled": True},
     },
+    # --- Publishing pipeline ---------------------------------------------
+    # Each entry binds a watched source to a destination and re-publishes its
+    # Markdown snapshot on every stable change. Git auth is the user's own
+    # SSH/credential setup; the app stores no tokens. See README for fields.
+    #   {"source_id", "type": git_markdown|git_pages|pdf_template, "repo",
+    #    "branch", "path", "template", "approval": auto|manual, "site_url"}
+    "publish": [],
 }
 
 

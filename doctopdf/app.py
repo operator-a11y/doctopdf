@@ -47,7 +47,7 @@ from AppKit import (
 from Foundation import NSMakeRect, NSObject
 
 from . import (alerts, audit, config, digest, drive, launchagent, pipeline, prefs,
-               rag, summarize, web)
+               publish, rag, summarize, web)
 from .drive import AuthFlowError, DriveError, ReauthRequired
 from .pipeline import sanitize_filename  # re-exported for convenience
 
@@ -70,6 +70,10 @@ WEB_BACKOFF_CAP = 3600       # max backoff for a bot-blocked site (1h)
 
 RAG_RETRY_BASE = 30          # seconds before the first embed retry
 RAG_RETRY_CAP = 600          # max backoff while the embedder stays down
+
+PUB_RETRY_BASE = 30          # seconds before the first publish (push) retry
+PUB_RETRY_CAP = 900          # max backoff while a push keeps failing
+RECENT_PUB_MAX = 15          # entries kept in the "Recent publishes" list
 
 
 class DocToPDFController(NSObject):
@@ -150,6 +154,18 @@ class DocToPDFController(NSObject):
             except Exception:  # noqa: BLE001 — never let RAG setup break startup
                 self._rag = None
 
+        # --- Publishing plumbing -------------------------------------------
+        # A single worker serializes git push / render off the watch loop, so a
+        # slow push never blocks watching and concurrent git can't corrupt a
+        # working copy. Publishing is additive: failures surface + retry.
+        self._pub_q: queue.Queue = queue.Queue()
+        self._pub_status: dict = {}         # target_key -> status dict (menu)
+        self._pub_pending: dict = {}        # target_key -> (target, name, md) awaiting Approve
+        self._pub_retry: dict = {}          # target_key -> (task, due_monotonic) after a push fail
+        self._pub_backoff: dict = {}        # target_key -> current retry backoff seconds
+        self._recent_pub: deque = deque(maxlen=RECENT_PUB_MAX)
+        self._pub_sig = None                # last-rendered Publishing submenu signature
+
         # Recent exports for the submenu (guarded by _lock; _recent_dirty tells
         # the UI timer to rebuild the submenu).
         self._recent: deque = deque(maxlen=RECENT_MAX)
@@ -183,6 +199,10 @@ class DocToPDFController(NSObject):
             self._rag_thread = threading.Thread(
                 target=self._rag_worker, name="doctopdf-rag", daemon=True)
             self._rag_thread.start()
+        # Dedicated publish worker: serializes git push / render off the watch loop.
+        self._pub_thread = threading.Thread(
+            target=self._pub_worker, name="doctopdf-publish", daemon=True)
+        self._pub_thread.start()
         # Repeating main-thread timer renders state onto the menu.
         self._uitimer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             1.0, self, "refreshUI:", None, True
@@ -244,9 +264,20 @@ class DocToPDFController(NSObject):
         self._mi_recent.setSubmenu_(self._recent_menu)
         menu.addItem_(self._mi_recent)
 
+        # "Publishing ▸" submenu: per-target status; click to approve/open/retry.
+        self._publish_menu = NSMenu.alloc().init()
+        self._publish_menu.setAutoenablesItems_(False)
+        self._mi_publish = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Publishing", None, "")
+        self._mi_publish.setSubmenu_(self._publish_menu)
+        self._mi_publish.setHidden_(True)   # shown only when publish targets exist
+        menu.addItem_(self._mi_publish)
+
         menu.addItem_(NSMenuItem.separatorItem())
         self._mi_pause = action("Pause", "onTogglePause:")
         action("Add Doc or Folder…", "onAddTarget:")
+        self._mi_pubnow = action("Publish now", "onPublishNow:")
+        self._mi_pubnow.setHidden_(True)    # shown only when publish targets exist
         action("Change history…", "onAuditHistory:")
         self._mi_reindex = action("Rebuild index", "onRebuildIndex:")
         self._mi_reindex.setHidden_(True)   # shown only when RAG is enabled
@@ -578,6 +609,9 @@ class DocToPDFController(NSObject):
         # Change intelligence: classify → filter → menu/notify/alert/log (async).
         if has_diff:
             self._handle_change(name, old_text, new_text, dict(cfg), who=t.get("who"))
+            # Publishing: re-publish the (stable) changed Markdown to bound targets.
+            for pt in self._pub_targets_for(fid):
+                self._pub_enqueue(pt, name, new_text)
         return result.get("warning")
 
     @objc.python_method
@@ -641,6 +675,8 @@ class DocToPDFController(NSObject):
                 if cfg.get("notify") and not cfg.get("ai_summary"):
                     self._notify(name, "Page changed")
                 self._handle_change(name, old, snap, cfg)  # reuse downstream pipeline
+                for pt in self._pub_targets_for(url):
+                    self._pub_enqueue(pt, name, snap)
         return None
 
     @objc.python_method
@@ -822,6 +858,133 @@ class DocToPDFController(NSObject):
             self._web_backoff.clear()
             self._force = True      # next poll re-captures + re-embeds every target
         self._wake.set()
+
+    # ------------------------------------------------------- publishing
+    @objc.python_method
+    def _pub_targets_for(self, source_id) -> list:
+        """Publish targets bound to a watched source id (from config)."""
+        with self._lock:
+            return [t for t in (self._config.get("publish") or [])
+                    if t.get("source_id") == source_id]
+
+    @objc.python_method
+    def _pub_enqueue(self, target, name, md_text, manual_ok=False) -> None:
+        """Queue a publish of ``md_text`` for ``target``. ``manual_ok`` bypasses
+        the approval gate (an explicit Publish-now / Approve)."""
+        self._pub_q.put((target, publish.target_key(target), name, md_text, manual_ok))
+
+    @objc.python_method
+    def _pub_worker(self) -> None:
+        """Drain publish tasks serially; retry failed pushes with backoff."""
+        while not self._stop.is_set():
+            try:
+                task = self._pub_q.get(timeout=1.0)
+            except queue.Empty:
+                self._pub_retry_due()
+                continue
+            try:
+                self._pub_run(task)
+            finally:
+                self._pub_q.task_done()
+
+    @objc.python_method
+    def _pub_run(self, task) -> None:
+        """Execute one publish task: approval gate → render/push → status/retry."""
+        target, key, name, md_text, manual_ok = task
+        approval = (target.get("approval") or "auto").lower()
+        site = target.get("site_url")
+
+        # Manual approval: a non-explicit change is held as pending (rendered on
+        # Approve), never pushed live mid-review.
+        if approval == "manual" and not manual_ok:
+            if not (md_text and md_text.strip()):
+                return
+            with self._lock:
+                self._pub_pending[key] = (target, name, md_text)
+            self._pub_set_status(key, name=name, type=target.get("type"),
+                                 site_url=site, status="pending")
+            self._notify(f"{name} — pending",
+                         "Site has pending changes — review & publish.")
+            return
+
+        self._pub_set_status(key, name=name, type=target.get("type"),
+                             site_url=site, status="publishing")
+        try:
+            res = publish.publish(target, name, md_text)
+        except publish.PublishSkip:
+            return  # empty snapshot — never publish a blank page or wipe a live one
+        except publish.PublishError as exc:
+            self._pub_set_status(key, status="error", error=str(exc))
+            bo = self._pub_backoff.get(key, PUB_RETRY_BASE)
+            self._pub_retry[key] = (task, time.monotonic() + bo)
+            self._pub_backoff[key] = min(PUB_RETRY_CAP, bo * 2)
+            self._notify(f"Publish failed — {name}", str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 — never let the publish worker die
+            self._pub_set_status(key, status="error", error=str(exc))
+            return
+
+        # Success — clear pending/retry, record status.
+        with self._lock:
+            self._pub_pending.pop(key, None)
+        self._pub_retry.pop(key, None)
+        self._pub_backoff[key] = PUB_RETRY_BASE
+        now = time.strftime("%H:%M:%S")
+        url = res.get("url") or site
+        pushed = res.get("status") == "published"   # vs 'unchanged' (no diff)
+        fields = {"name": name, "type": target.get("type"), "site_url": site,
+                  "status": "published", "url": url, "warning": res.get("warning"),
+                  "error": None}
+        if pushed:
+            fields["last_published"] = now
+        self._pub_set_status(key, **fields)
+        if pushed:
+            with self._lock:
+                self._recent_pub.appendleft({"time": now, "name": name, "url": url})
+            body = url or "done"
+            if res.get("warning"):
+                body += f" · {res['warning']}"
+            self._notify(f"Published {name}", body)
+
+    @objc.python_method
+    def _pub_retry_due(self) -> None:
+        """Re-run failed publishes whose backoff has elapsed (push recovered)."""
+        if not self._pub_retry:
+            return
+        now = time.monotonic()
+        for key, (task, due) in list(self._pub_retry.items()):
+            if self._stop.is_set():
+                return
+            if now >= due:
+                self._pub_retry.pop(key, None)
+                self._pub_run(task)
+
+    @objc.python_method
+    def _pub_set_status(self, key, **fields) -> None:
+        with self._lock:
+            self._pub_status.setdefault(key, {}).update(fields)
+
+    @objc.python_method
+    def _pub_approve(self, key) -> None:
+        """Approve a pending manual target → publish its held snapshot."""
+        with self._lock:
+            pend = self._pub_pending.get(key)
+        if pend:
+            target, name, md = pend
+            self._pub_enqueue(target, name, md, manual_ok=True)
+
+    @objc.python_method
+    def _pub_publish_all(self) -> None:
+        """Publish every target's current snapshot now (explicit user action)."""
+        with self._lock:
+            pubs = list(self._config.get("publish") or [])
+            snaps = dict(self._prev_text)
+            names = dict(self._entry_names)
+        for t in pubs:
+            sid = t.get("source_id")
+            md = snaps.get(sid)
+            if md:
+                self._pub_enqueue(t, names.get(sid) or sid, md, manual_ok=True)
 
     @objc.python_method
     def _handle_change(self, name, old_text, new_text, cfg, who=None) -> None:
@@ -1005,6 +1168,22 @@ class DocToPDFController(NSObject):
             self._mi_rag.setHidden_(True)
             self._mi_reindex.setHidden_(True)
 
+        # Publishing submenu: show only when targets exist; rebuild on change.
+        with self._lock:
+            pub_targets = list(self._config.get("publish") or [])
+            pub_status = {k: dict(v) for k, v in self._pub_status.items()}
+        has_pub = bool(pub_targets)
+        self._mi_publish.setHidden_(not has_pub)
+        self._mi_pubnow.setHidden_(not has_pub)
+        if has_pub:
+            sig = repr([(publish.target_key(t),
+                         pub_status.get(publish.target_key(t), {}).get("status"),
+                         pub_status.get(publish.target_key(t), {}).get("last_published"))
+                        for t in pub_targets])
+            if sig != self._pub_sig:
+                self._rebuild_publish_menu(pub_targets, pub_status)
+                self._pub_sig = sig
+
         # "Launch at Login" checkmark reflects whether the LaunchAgent is installed.
         self._mi_login.setState_(
             NSControlStateValueOn if launchagent.is_installed() else NSControlStateValueOff
@@ -1183,6 +1362,42 @@ class DocToPDFController(NSObject):
         self._rag_set_note("Rebuilding index…")
         self._rag_q.put(("reindex", None, None, None, None, None))
 
+    def onPublishTarget_(self, sender) -> None:
+        key = sender.representedObject()
+        with self._lock:
+            st = dict(self._pub_status.get(key, {}))
+            pending = key in self._pub_pending
+        state = st.get("status")
+        if state == "pending" or pending:
+            self._pub_approve(key)                 # approve & publish held snapshot
+        elif st.get("url") and str(st["url"]).startswith("http"):
+            subprocess.run(["open", str(st["url"])], check=False)   # open live site
+        elif state == "error":
+            self._pub_publish_one(key)             # retry now
+        elif st.get("url"):
+            subprocess.run(["open", str(st["url"])], check=False)   # local PDF path
+
+    @objc.python_method
+    def _pub_publish_one(self, key) -> None:
+        """Re-publish the current snapshot for a single target (retry)."""
+        with self._lock:
+            target = next((t for t in (self._config.get("publish") or [])
+                           if publish.target_key(t) == key), None)
+            snaps = dict(self._prev_text)
+            names = dict(self._entry_names)
+        if target:
+            sid = target.get("source_id")
+            if snaps.get(sid):
+                self._pub_enqueue(target, names.get(sid) or sid, snaps[sid], manual_ok=True)
+
+    def onPublishNow_(self, _sender) -> None:
+        with self._lock:
+            empty = not (self._config.get("publish") or [])
+        if empty:
+            self._alert("No publish targets", "Add a publish target in Preferences first.")
+            return
+        self._pub_publish_all()
+
     def onPreferences_(self, _sender) -> None:
         self._prefs = prefs.PreferencesController.alloc().initWithApp_(self)
         self._prefs.show()
@@ -1216,6 +1431,12 @@ class DocToPDFController(NSObject):
                 digest.seed_if_unset(datetime.now())
             except Exception:  # noqa: BLE001 — best-effort seed
                 pass
+        # Newly-bound publish targets: publish the source's current snapshot now
+        # (auto → live, manual → pending), so binding takes effect without waiting
+        # for the next edit.
+        old_keys = {publish.target_key(t) for t in (self._config.get("publish") or [])}
+        new_targets = [t for t in (cfg.get("publish") or [])
+                       if publish.target_key(t) not in old_keys]
         with self._lock:
             self._config.update(cfg)
             try:
@@ -1225,6 +1446,12 @@ class DocToPDFController(NSObject):
             self._interval = self._base_interval
             if changed:
                 self._force = True  # re-export so new formats/outputs take effect now
+            snaps = dict(self._prev_text)
+            names = dict(self._entry_names)
+        for t in new_targets:
+            sid = t.get("source_id")
+            if snaps.get(sid):
+                self._pub_enqueue(t, names.get(sid) or sid, snaps[sid])
         config.save_config(self._config)
         if changed:
             self._wake.set()
@@ -1310,6 +1537,43 @@ class DocToPDFController(NSObject):
             item.setTarget_(self)
             item.setRepresentedObject_(entry["path"])
             self._recent_menu.addItem_(item)
+
+    @objc.python_method
+    def _rebuild_publish_menu(self, targets, status) -> None:
+        """Rebuild the Publishing submenu (main thread, from refreshUI_).
+
+        Each target shows its status; clicking: a *pending* target approves &
+        publishes it; a *published* one opens its site URL; an *errored* one
+        retries. A trailing hint explains the click behavior.
+        """
+        self._publish_menu.removeAllItems()
+        _GLYPH = {"published": "✅", "pending": "🟡", "error": "⚠️",
+                  "publishing": "🔄", None: "•"}
+        for t in targets:
+            key = publish.target_key(t)
+            st = status.get(key, {})
+            name = st.get("name") or t.get("source_id") or "?"
+            state = st.get("status")
+            if state == "published":
+                extra = f"published {st.get('last_published', '')}".strip()
+            elif state == "pending":
+                extra = "pending — click to approve"
+            elif state == "error":
+                extra = f"error: {st.get('error', '')}"[:60]
+            elif state == "publishing":
+                extra = "publishing…"
+            else:
+                extra = t.get("type") or "git_markdown"
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"{_GLYPH.get(state, '•')} {name} — {extra}", "onPublishTarget:", "")
+            item.setTarget_(self)
+            item.setRepresentedObject_(key)
+            self._publish_menu.addItem_(item)
+        self._publish_menu.addItem_(NSMenuItem.separatorItem())
+        hint = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Click: approve pending · open site · retry errors", None, "")
+        hint.setEnabled_(False)
+        self._publish_menu.addItem_(hint)
 
     @objc.python_method
     def _notify(self, title: str, message: str) -> None:

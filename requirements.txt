@@ -15,3 +15,7 @@ playwright>=1.40.0          # JS-rendered pages; also run: playwright install ch
 # against Ollama (POST /api/embed) — no extra embedding dependency.
 chromadb>=0.5.0
 mcp>=1.0.0
+# Publishing pipeline: Markdown → sanitized HTML. PDF reuses Playwright Chromium;
+# git push reuses subprocess git — no extra engine.
+markdown>=3.4
+nh3>=0.2
