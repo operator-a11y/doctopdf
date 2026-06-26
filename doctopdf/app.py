@@ -20,6 +20,7 @@ stays responsive during multi-second exports and the interactive auth flow.
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import threading
 import time
@@ -408,7 +409,11 @@ class DocToPDFController(NSObject):
         for t in targets:
             base = pipeline.sanitize_filename(t["name"]) or t["id"]
             if counts[base] > 1:
-                t["name"] = f"{t['name']} ({t['id'][:6]})"
+                # Drive ids are unique in 6 chars; a web id is a URL (all share
+                # the "https:" prefix), so hash it for a distinguishing suffix.
+                suffix = (t["id"][:6] if t.get("kind") == "drive"
+                          else hashlib.md5(t["id"].encode()).hexdigest()[:6])
+                t["name"] = f"{t['name']} ({suffix})"
 
         with self._lock:
             self._entry_names = entry_names
@@ -507,11 +512,18 @@ class DocToPDFController(NSObject):
         to the SAME pipeline a Doc change uses. Returns a warning string or None;
         never raises (web failures self-handle with backoff)."""
         url, name = t["url"], t["name"]
-        interval = max(WEB_MIN_INTERVAL, int(t.get("poll_seconds") or WEB_DEFAULT_INTERVAL))
+        try:
+            interval = max(WEB_MIN_INTERVAL, int(t.get("poll_seconds") or WEB_DEFAULT_INTERVAL))
+        except (TypeError, ValueError):
+            interval = WEB_DEFAULT_INTERVAL  # malformed config must never raise here
         nowm = time.monotonic()
         with self._lock:
-            if not force and nowm < self._web_next.get(url, 0.0):
-                return None  # not due yet (web polls far slower than docs)
+            blocked = url in self._web_backoff
+            nxt = self._web_next.get(url, 0.0)
+            # Skip if not due — and even on 'force' don't hammer a bot-blocked site
+            # before its backoff elapses.
+            if (not force or blocked) and nowm < nxt:
+                return None
 
         self._update_state(kind="exporting")
         cfg = dict(self._config)
@@ -526,7 +538,8 @@ class DocToPDFController(NSObject):
             return f"{name}: {exc} — backing off"
         except web.WebError as exc:  # WebSkip (selector empty) included — warn, no diff
             with self._lock:
-                self._web_next[url] = nowm + interval
+                # Don't shrink an active backoff (e.g. block followed by a timeout).
+                self._web_next[url] = max(self._web_next.get(url, 0.0), nowm + interval)
             return f"{name}: {exc}"
 
         # Success — reset backoff; jitter the next poll so targets stay staggered.
@@ -763,16 +776,18 @@ class DocToPDFController(NSObject):
         non-Google http(s) URL → web entry. Returns None if neither."""
         if not text:
             return None
+        from urllib.parse import urlparse
         is_url = text.lower().startswith(("http://", "https://"))
-        google = is_url and "google.com" in text.lower()
+        host = (urlparse(text).hostname or "").lower() if is_url else ""
+        google = host == "google.com" or host.endswith((".google.com",))
         gid = drive.parse_doc_id(text)
         if gid and (not is_url or google):
             return {"id": gid}
         if is_url:
-            from urllib.parse import urlparse
             p = urlparse(text)
             nm = (p.netloc + p.path).rstrip("/")[:60] or text
-            return {"kind": "web", "url": text, "name": nm,
+            # id == url so web targets show in the Watching submenu and can be removed.
+            return {"kind": "web", "id": text, "url": text, "name": nm,
                     "render": "static", "mode": "text",
                     "poll_seconds": WEB_DEFAULT_INTERVAL}
         return None

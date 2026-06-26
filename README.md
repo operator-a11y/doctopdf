@@ -260,7 +260,8 @@ diffed; a real content change flows into the *exact same* pipeline as a Doc chan
   "selector": "#pricing-table",  // optional CSS scope — monitor just this region
   "mode": "text",                // text (robust) | html (catch structural changes)
   "poll_seconds": 600,           // web polls far slower than docs — be polite
-  "severity_min": "substantive"  // per-target severity threshold (optional)
+  "severity_min": "substantive", // per-target severity threshold (optional)
+  "ignore": "Updated \\d{4}-\\d{2}"  // optional regex — drop matching lines (volatile bits)
 }
 ```
 

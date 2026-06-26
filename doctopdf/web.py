@@ -19,8 +19,10 @@ import requests
 
 UA = ("DocToPDF/1.0 (+https://github.com/operator-a11y/doctopdf; "
       "personal change monitor)")
-STATIC_TIMEOUT = 20      # seconds
+STATIC_TIMEOUT = 20      # seconds (connect, read)
+MAX_BYTES = 8 * 1024 * 1024   # cap a fetch so a huge/streaming page can't OOM us
 BROWSER_TIMEOUT = 25     # seconds (cap render wait so JS pages can't hang us)
+RETRYABLE_STATUS = (403, 429, 503)   # bot-block / overload → back off, don't hammer
 
 
 class WebError(Exception):
@@ -40,16 +42,31 @@ class BotBlocked(WebError):
 # ---------------------------------------------------------------------------
 
 
-def fetch_static(url: str) -> str:
+def fetch_static(url: str) -> bytes:
+    """Fetch up to MAX_BYTES of a page as raw bytes (so the parsers can sniff the
+    page's own <meta charset>, not requests' latin-1 header fallback)."""
     try:
-        r = requests.get(url, headers={"User-Agent": UA}, timeout=STATIC_TIMEOUT)
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=STATIC_TIMEOUT,
+                         stream=True)
     except requests.RequestException as exc:
         raise WebError(f"fetch failed: {exc}") from exc
-    if r.status_code in (403, 429):
-        raise BotBlocked(f"blocked (HTTP {r.status_code})")
-    if r.status_code >= 400:
-        raise WebError(f"HTTP {r.status_code}")
-    return r.text
+    try:
+        if r.status_code in RETRYABLE_STATUS:
+            raise BotBlocked(f"blocked (HTTP {r.status_code})")
+        if r.status_code >= 400:
+            raise WebError(f"HTTP {r.status_code}")
+        chunks, total = [], 0
+        try:
+            for chunk in r.iter_content(64 * 1024):
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > MAX_BYTES:
+                    raise WebError(f"page too large (>{MAX_BYTES // (1024 * 1024)} MB)")
+        except requests.RequestException as exc:
+            raise WebError(f"fetch failed mid-stream: {exc}") from exc
+        return b"".join(chunks)
+    finally:
+        r.close()
 
 
 def fetch_browser(url: str, selector: Optional[str]) -> str:
@@ -89,7 +106,9 @@ def fetch_browser(url: str, selector: Optional[str]) -> str:
 # Extract + denoise
 # ---------------------------------------------------------------------------
 
-_WS = re.compile(r"[ \t]+")
+# Collapse runs of any unicode whitespace (incl. nbsp \xa0) to a single space —
+# otherwise a page swapping a space for an nbsp creates a phantom diff.
+_WS = re.compile(r"[^\S\n]+")
 # Attributes that change every load and would create phantom HTML diffs.
 _VOLATILE_ATTRS = ("nonce", "csrf", "csrf-token", "integrity", "data-nonce",
                    "data-csrf", "data-turbo-track")
@@ -114,41 +133,41 @@ def _clean_html(node) -> str:
         for attr in list(tag.attrs):
             if attr in _VOLATILE_ATTRS or attr.startswith("on"):
                 del tag[attr]
+    # Structural empty check: a node stripped to no real text is almost always a
+    # transient broken/empty render — skip rather than report a mass deletion.
+    if not node.get_text(strip=True):
+        raise WebSkip("rendered content was empty")
     return _normalize_text(node.prettify())
 
 
-def extract(html: str, selector: Optional[str], mode: str) -> str:
-    """Reduce raw HTML to a clean content snapshot. Raises WebSkip if a selector
-    matches nothing (so a site redesign warns instead of faking a mass deletion)."""
-    if selector:
+def extract(html, selector: Optional[str], mode: str) -> str:
+    """Reduce raw HTML (bytes or str) to a clean content snapshot. ``html`` is
+    passed to the parsers as bytes when available so they sniff the page's own
+    <meta charset>. Raises WebSkip if a selector matches nothing (so a redesign
+    warns instead of faking a mass deletion)."""
+    if selector or mode == "html":
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "lxml")
-        el = soup.select_one(selector)
-        if el is None:
-            raise WebSkip(f"selector '{selector}' matched nothing (page redesigned?)")
-        return _clean_html(el) if mode == "html" else _normalize_text(el.get_text("\n"))
-
-    if mode == "html":
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "lxml")
+        if selector:
+            el = soup.select_one(selector)
+            if el is None:
+                raise WebSkip(f"selector '{selector}' matched nothing (page redesigned?)")
+            return _clean_html(el) if mode == "html" else _normalize_text(el.get_text("\n"))
         for tag in soup(["nav", "footer", "header", "aside", "form"]):
             tag.decompose()
-        body = soup.body or soup
-        return _clean_html(body)
+        return _clean_html(soup.body or soup)
 
-    # mode == "text": main-content extraction with boilerplate removal.
+    # mode == "text": main-content extraction with boilerplate removal. Use ONE
+    # extractor (trafilatura) so the snapshot is stable; if it can't extract,
+    # skip with a warning (a second extractor would cause a one-off false diff).
     try:
         import trafilatura
         text = trafilatura.extract(html, include_comments=False, include_tables=True,
                                    favor_recall=True)
-    except Exception:  # noqa: BLE001 — fall back to a crude strip
-        text = None
-    if not text:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "lxml")
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
-            tag.decompose()
-        text = (soup.body or soup).get_text("\n")
+    except Exception as exc:  # noqa: BLE001
+        raise WebError(f"extraction failed: {exc}") from exc
+    if not text or not text.strip():
+        raise WebSkip("couldn't extract main content — add a CSS 'selector'")
     return _normalize_text(text)
 
 
@@ -157,11 +176,21 @@ def snapshot(target: dict) -> str:
     url = target.get("url")
     if not url:
         raise WebError("no url")
+    if not str(url).lower().startswith(("http://", "https://")):
+        raise WebError("only http(s) URLs are supported")
     render = (target.get("render") or "static").lower()
     selector = target.get("selector") or None
     mode = (target.get("mode") or "text").lower()
     html = fetch_browser(url, selector) if render == "browser" else fetch_static(url)
     snap = extract(html, selector, mode)
+    # Optional per-target regex to drop volatile lines (timestamps, counters, …).
+    ignore = target.get("ignore")
+    if ignore:
+        try:
+            pat = re.compile(ignore)
+            snap = "\n".join(ln for ln in snap.splitlines() if not pat.search(ln))
+        except re.error:
+            pass  # bad pattern — ignore the filter rather than fail the poll
     if not snap.strip():
         raise WebSkip("extracted content was empty")
     return snap
