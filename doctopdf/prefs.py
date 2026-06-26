@@ -35,6 +35,9 @@ from Foundation import NSObject
 from . import config, launchagent
 
 W, H = 580, 470
+# Y of the first control row in each tab. Kept clear of the tab strip at the top
+# of the content area (see _tab) so rows never collide with the tab buttons.
+CONTENT_TOP = H - 150
 from .summarize import SEVERITIES  # noqa: E402
 
 
@@ -86,7 +89,10 @@ class PreferencesController(NSObject):
 
     @objc.python_method
     def _tab(self, tabs, title):
-        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 36, H - 96))
+        # Height matches the tab view's content rect (below the tab strip), so
+        # the top row clears the tab buttons instead of being pushed up into
+        # them when NSTabView fits the view to its content area.
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 36, H - 116))
         item = NSTabViewItem.alloc().initWithIdentifier_(title)
         item.setLabel_(title)
         item.setView_(view)
@@ -109,7 +115,7 @@ class PreferencesController(NSObject):
 
         # ---- General ----
         v = self._tab(tabs, "General")
-        y = H - 130
+        y = CONTENT_TOP
         _label(v, "Poll interval (s):", 14, y + 2); self.poll = _field(v, cfg.get("poll_interval", 10), 175, y, 70); y -= 32
         _label(v, "Output folder:", 14, y + 2); self.outdir = _field(v, cfg.get("output_dir", "~/Desktop"), 175, y, 350); y -= 32
         _label(v, "Formats:", 14, y + 2); self.formats = _field(v, ", ".join(cfg.get("formats") or ["pdf"]), 175, y, 350); y -= 18
@@ -119,7 +125,7 @@ class PreferencesController(NSObject):
 
         # ---- Versions ----
         v = self._tab(tabs, "Versions")
-        y = H - 130
+        y = CONTENT_TOP
         self.timestamped = _check(v, "Keep a timestamped copy of every version", cfg.get("timestamped"), 14, y); y -= 30
         _label(v, "Rolling — keep last N (0 = off):", 14, y + 2, 240); self.keep = _field(v, cfg.get("keep_versions", 0), 255, y, 60); y -= 34
         self.git = _check(v, "Git version history", bool(cfg.get("git_repo")), 14, y, 160)
@@ -128,7 +134,7 @@ class PreferencesController(NSObject):
 
         # ---- Change alerts ----
         v = self._tab(tabs, "Change Alerts")
-        y = H - 122
+        y = CONTENT_TOP
         self.ai = _check(v, "AI change summary + classify (local Ollama)", cfg.get("ai_summary"), 14, y, 320)
         _label(v, "Model:", 330, y + 1, 46); self.model = _field(v, cfg.get("ollama_model", "llama3"), 378, y - 1, 150); y -= 28
         _label(v, "Ollama URL:", 14, y + 2); self.ollama = _field(v, cfg.get("ollama_url", "http://localhost:11434"), 175, y, 350); y -= 30
@@ -149,7 +155,7 @@ class PreferencesController(NSObject):
 
         # ---- Advanced ----
         v = self._tab(tabs, "Advanced")
-        y = H - 130
+        y = CONTENT_TOP
         _label(v, "Post-export cmd:", 14, y + 2); self.hook = _field(v, cfg.get("post_export_cmd"), 175, y, 350); y -= 18
         _label(v, "Runs after each export. $1 = file path; $DOCTOPDF_FILES, $DOCTOPDF_DOC_NAME set.", 175, y, 370, size=9)
 
