@@ -62,6 +62,8 @@ def search_knowledge(query: str, k: int = 5) -> dict:
         return {"error": "embedder_unavailable", "detail": str(exc), "results": []}
     except rag.RagUnavailable as exc:
         return {"error": "store_unavailable", "detail": str(exc), "results": []}
+    except Exception as exc:  # noqa: BLE001 — return a structured error, never crash the tool
+        return {"error": "query_failed", "detail": str(exc), "results": []}
     return {"error": None, "count": len(results), "results": results}
 
 

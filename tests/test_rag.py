@@ -221,6 +221,36 @@ class _Resp:
             raise requests.HTTPError(f"{self.status_code}")
 
 
+class ConfigAndRoutingTests(unittest.TestCase):
+    """Embedder config merge + provider routing (regressions for review fixes)."""
+
+    def test_deep_fill_preserves_api_key(self):
+        from doctopdf import config
+        stored = {"enabled": True,
+                  "embedder": {"provider": "openai", "model": "m", "api_key": "sk-x"}}
+        filled = config._deep_fill(stored, config.DEFAULT_CONFIG["rag"])
+        # api_key isn't in the default embedder, but must survive the merge.
+        self.assertEqual(filled["embedder"]["api_key"], "sk-x")
+        self.assertEqual(filled["embedder"]["model"], "m")
+        self.assertIsNone(filled["embedder"]["url"])        # backfilled default
+        self.assertEqual(filled["mcp"], {"enabled": True})  # absent sub-block filled
+
+    def test_openai_not_misrouted_to_default_url(self):
+        # With the default (null) embedder URL, an OpenAI request must hit the
+        # OpenAI base, never the Ollama localhost default.
+        captured = {}
+
+        def fake_post(url, **kw):
+            captured["url"] = url
+            return _Resp(200, {"data": [{"index": 0, "embedding": [1.0]}]})
+
+        with mock.patch("doctopdf.rag.requests.post", side_effect=fake_post):
+            rag.embed(["hi"], {"provider": "openai", "model": "m",
+                               "url": None, "api_key": "sk-x"})
+        self.assertIn("api.openai.com", captured["url"])
+        self.assertNotIn("11434", captured["url"])
+
+
 class OllamaEmbedTests(unittest.TestCase):
     """The embedder HTTP path (mocked) — batch endpoint + legacy fallback."""
 
@@ -252,6 +282,85 @@ class OllamaEmbedTests(unittest.TestCase):
                         side_effect=requests.ConnectionError("refused")):
             with self.assertRaises(rag.EmbedError):
                 rag.embed(["x"], {"provider": "ollama", "model": "m"})
+
+
+class AppRemovalAndReindexTests(unittest.TestCase):
+    """App-level wiring: two-strike removal + reindex re-baseline (review fixes)."""
+
+    def _ctrl(self):
+        # A bare object carrying just the fields the methods touch.
+        import threading
+        from doctopdf.app import DocToPDFController
+        obj = type("Ctl", (), {})()
+        obj._rag_indexed = set()
+        obj._rag_drop_pending = set()
+        obj._rag = object()                 # truthy; helper doesn't call it
+        obj._drops_for = lambda live: DocToPDFController._rag_drops_for(obj, live)
+        return obj, DocToPDFController
+
+    def test_two_strike_purges_only_after_second_absence(self):
+        ctl, _ = self._ctrl()
+        ctl._rag_indexed = {"A", "B", "C"}
+        # Cycle 1: C absent → remembered, NOT purged yet.
+        self.assertEqual(ctl._drops_for({"A", "B"}), [])
+        self.assertEqual(ctl._rag_drop_pending, {"C"})
+        # Cycle 2: C still absent → purged now.
+        self.assertEqual(ctl._drops_for({"A", "B"}), ["C"])
+        self.assertNotIn("C", ctl._rag_indexed)
+        self.assertEqual(ctl._rag_drop_pending, set())
+
+    def test_transient_absence_does_not_purge(self):
+        ctl, _ = self._ctrl()
+        ctl._rag_indexed = {"A", "B", "C"}
+        self.assertEqual(ctl._drops_for({"A", "B"}), [])     # C absent once
+        # C reappears next cycle → must be forgotten, never purged.
+        self.assertEqual(ctl._drops_for({"A", "B", "C"}), [])
+        self.assertEqual(ctl._rag_drop_pending, set())
+        self.assertIn("C", ctl._rag_indexed)
+
+    def test_reindex_rebaselines_all_state(self):
+        import threading
+        from doctopdf.app import DocToPDFController, RAG_RETRY_BASE
+
+        class FakeStore:
+            def __init__(self): self.reindexed = False
+            def reindex(self): self.reindexed = True
+            def stats(self): return {"count": 0, "last_sync": None}
+
+        ctl = type("Ctl", (), {})()
+        ctl._rag = FakeStore()
+        ctl._lock = threading.RLock()
+        ctl._wake = threading.Event()
+        ctl._state = {}
+        ctl._rag_pending = {"X": ("sync",)}
+        ctl._rag_dim_mismatch = True
+        ctl._rag_backoff = 999
+        ctl._rag_indexed = {"A", "B"}
+        ctl._rag_drop_pending = {"C"}
+        ctl._prev_text = {"A": "t", "url": "t"}
+        ctl._modified = {"A": "m"}
+        ctl._web_next = {"url": 1.0}
+        ctl._web_backoff = {"url": 2.0}
+        ctl._force = False
+        ctl._rag_set_note = lambda n: ctl._state.__setitem__("rag_note", n)
+        ctl._rag_refresh_stats = lambda: None
+
+        DocToPDFController._rag_reindex(ctl)
+
+        self.assertTrue(ctl._rag.reindexed)
+        self.assertFalse(ctl._rag_dim_mismatch)
+        self.assertEqual(ctl._rag_pending, {})
+        self.assertEqual(ctl._rag_backoff, RAG_RETRY_BASE)
+        # Every per-target baseline is cleared so the forced poll re-embeds ALL
+        # targets (the web-target regression fix).
+        self.assertEqual(ctl._prev_text, {})
+        self.assertEqual(ctl._modified, {})
+        self.assertEqual(ctl._web_next, {})
+        self.assertEqual(ctl._web_backoff, {})
+        self.assertEqual(ctl._rag_indexed, set())
+        self.assertEqual(ctl._rag_drop_pending, set())
+        self.assertTrue(ctl._force)
+        self.assertTrue(ctl._wake.is_set())
 
 
 if __name__ == "__main__":

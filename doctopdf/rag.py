@@ -465,6 +465,9 @@ def cli_query(argv: list) -> int:
     except RagUnavailable as exc:
         print(f"Vector store unavailable: {exc}", flush=True)
         return 5
+    except Exception as exc:  # noqa: BLE001 — a clean message beats a raw traceback
+        print(f"Query failed: {exc}", flush=True)
+        return 6
     if not results:
         print("No matching chunks. Is anything indexed yet? (start the app to sync)", flush=True)
         return 0

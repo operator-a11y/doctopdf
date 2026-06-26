@@ -97,7 +97,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "embedder": {
             "provider": "ollama",            # ollama | openai
             "model": "nomic-embed-text",
-            "url": "http://localhost:11434",
+            # Provider-agnostic: each provider applies its own default base URL
+            # (Ollama → localhost:11434, OpenAI → api.openai.com) when this is
+            # null, so switching provider doesn't misroute to the other's host.
+            "url": None,
             # "api_key": null,               # openai only; falls back to $OPENAI_API_KEY
         },
         "chunk": {"size": 1000, "overlap": 150},
@@ -109,11 +112,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
 def _deep_fill(value: Any, default: Any) -> Any:
     """Recursively backfill missing keys in a nested-dict config value from its
     default, so adding a sub-key (e.g. ``rag.mcp``) doesn't get dropped when an
-    older stored config supplies only part of the object."""
+    older stored config supplies only part of the object. Keys the user supplied
+    that aren't in the default (e.g. ``rag.embedder.api_key``) are preserved."""
     if isinstance(default, dict):
         if not isinstance(value, dict):
             return dict(default)
-        return {k: _deep_fill(value.get(k, default[k]), default[k]) for k in default}
+        merged = dict(value)            # keep user-supplied extras not in the default
+        for k in default:
+            merged[k] = _deep_fill(value.get(k, default[k]), default[k])
+        return merged
     return value
 
 

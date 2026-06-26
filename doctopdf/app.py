@@ -139,6 +139,11 @@ class DocToPDFController(NSObject):
         self._rag_retry_at = 0.0            # monotonic time of next embed retry
         self._rag_backoff = RAG_RETRY_BASE
         self._rag_dim_mismatch = False      # set on an embedder swap; needs reindex
+        # Target ids we've sent to the index, and ones seen absent once. A target
+        # must be missing for TWO consecutive clean cycles before its vectors are
+        # purged, so a transient incomplete folder listing can't churn them.
+        self._rag_indexed: set = set()
+        self._rag_drop_pending: set = set()
         if (self._config.get("rag") or {}).get("enabled"):
             try:
                 self._rag = rag.RagStore(self._config)
@@ -495,18 +500,20 @@ class DocToPDFController(NSObject):
                 notes.append(f"{t['name']}: {exc}")
 
         live = {t["id"] for t in targets}
-        dropped = []
+        rag_drops = []
         with self._lock:
             # Bound per-target state to currently-resolved targets, but only on a
             # fully clean cycle so a transient failure doesn't drop a baseline.
             if completed and not notes:
-                # Targets we had snapshots for but no longer resolve (target or
-                # folder-child removed) — their vectors must be cleaned up too.
-                dropped = [k for k in self._prev_text if k not in live]
                 self._modified = {k: v for k, v in self._modified.items() if k in live}
                 self._prev_text = {k: v for k, v in self._prev_text.items() if k in live}
                 self._web_next = {k: v for k, v in self._web_next.items() if k in live}
                 self._web_backoff = {k: v for k, v in self._web_backoff.items() if k in live}
+                # Vectors for indexed targets that are now absent — but only purge
+                # after a SECOND consecutive clean cycle of absence, so a transient
+                # incomplete listing doesn't delete (then re-embed) a live target.
+                if self._rag is not None:
+                    rag_drops = self._rag_drops_for(live)
             # Only publish batch status on a completed (non-paused) cycle, so a
             # mid-batch pause doesn't leave a partial count/warning.
             if completed:
@@ -522,8 +529,8 @@ class DocToPDFController(NSObject):
                     self._state["warning"] = f"{len(notes)} issues (e.g. {notes[0]})"
 
         # Purge vectors for removed targets/folder-children (outside the lock).
-        if self._rag is not None and dropped:
-            for tid in dropped:
+        if self._rag is not None and rag_drops:
+            for tid in rag_drops:
                 self._rag_enqueue_delete(tid)
 
     @objc.python_method
@@ -668,6 +675,7 @@ class DocToPDFController(NSObject):
         """
         if self._rag is None or not (text and text.strip()):
             return
+        self._rag_indexed.add(target_id)
         self._rag_q.put(("sync", target_id, name, kind, link or "", text))
 
     @objc.python_method
@@ -676,6 +684,18 @@ class DocToPDFController(NSObject):
         if self._rag is None:
             return
         self._rag_q.put(("delete", target_id, None, None, None, None))
+
+    @objc.python_method
+    def _rag_drops_for(self, live) -> list:
+        """Two-strike removal: return indexed target ids that have been absent for
+        a SECOND consecutive clean cycle, updating the strike sets. A single-cycle
+        absence (transient incomplete listing) is remembered but not purged — it
+        clears the moment the target reappears. Caller holds ``self._lock``."""
+        absent = self._rag_indexed - live
+        drops = list(absent & self._rag_drop_pending)
+        self._rag_drop_pending = absent - set(drops)
+        self._rag_indexed -= set(drops)
+        return drops
 
     @objc.python_method
     def _rag_worker(self) -> None:
@@ -741,10 +761,15 @@ class DocToPDFController(NSObject):
             return  # only a reindex clears this
         if time.monotonic() < self._rag_retry_at:
             return
-        for task in list(self._rag_pending.values()):
+        for tid, task in list(self._rag_pending.items()):
             if self._stop.is_set():
                 return
             self._rag_run(task)
+            # If it's still pending, the embedder is still down — stop this round
+            # rather than hammering it once per queued target (and bumping the
+            # backoff 2^N). _rag_run already scheduled the next retry window.
+            if tid in self._rag_pending:
+                break
 
     @objc.python_method
     def _rag_refresh_stats(self) -> None:
@@ -780,9 +805,21 @@ class DocToPDFController(NSObject):
         self._rag_dim_mismatch = False
         self._rag_pending.clear()
         self._rag_backoff = RAG_RETRY_BASE
+        self._rag_indexed.clear()
+        self._rag_drop_pending.clear()
         self._rag_set_note(None)
         self._rag_refresh_stats()
         with self._lock:
+            # Re-baseline EVERY target so the forced poll re-embeds all of them.
+            # Without clearing _prev_text, an unchanged web page (old == snapshot)
+            # would be skipped by _poll_web's change gate and silently vanish from
+            # the rebuilt index. Clearing it makes old_text None → a clean baseline
+            # (no spurious change alerts); clearing the web schedule forces an
+            # immediate re-fetch rather than waiting out the poll interval.
+            self._prev_text.clear()
+            self._modified.clear()
+            self._web_next.clear()
+            self._web_backoff.clear()
             self._force = True      # next poll re-captures + re-embeds every target
         self._wake.set()
 
