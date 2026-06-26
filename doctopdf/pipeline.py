@@ -300,9 +300,15 @@ def run_export(cfg: dict, service, file_id: str, name: str, gtype: str = "docume
     git_repo = cfg.get("git_repo")
 
     # Decide every format we must export: the requested outputs, plus a text
-    # format (valid for this type) for the git snapshot / AI summary so history
-    # and summaries have real text to diff.
-    want_text = (git_repo and cfg.get("git_snapshot_text", True)) or cfg.get("ai_summary")
+    # format (valid for this type) so git history, AI summaries, and change
+    # detection (for alerts/digests) have real text to diff.
+    want_text = bool(
+        (git_repo and cfg.get("git_snapshot_text", True))
+        or cfg.get("ai_summary")
+        or cfg.get("webhook_urls")
+        or cfg.get("email_to")
+        or (cfg.get("digest", "off") not in (None, "off"))
+    )
     needed = list(formats)
     if want_text and not any(f in TEXT_FORMATS for f in needed):
         # Prefer by TEXT_FORMATS order (md for Docs, csv for Sheets, …).

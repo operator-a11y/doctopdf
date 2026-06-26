@@ -64,10 +64,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Post a macOS notification on each export.
     "notify": False,
     # AI change summaries via a LOCAL model (no cloud key). On each change, diff
-    # the doc's text and have the local model summarize it as a notification.
+    # the doc's text and have the local model summarize + classify it.
     "ai_summary": False,
     "ollama_url": "http://localhost:11434",
     "ollama_model": "llama3",
+    # --- Change intelligence ---------------------------------------------
+    # Only alert at/above this severity: cosmetic < substantive < material.
+    # "cosmetic" = alert on everything; raise it to cut notification fatigue.
+    "min_severity": "cosmetic",
+    # External alert destinations for changes that pass the threshold.
+    "webhook_urls": [],            # Slack / Discord / generic incoming webhooks
+    "email_to": None,              # alert recipient (needs the SMTP settings below)
+    "email_from": None,
+    "smtp_host": None,
+    "smtp_port": 587,
+    "smtp_user": None,
+    "smtp_pass": None,
+    # Scheduled digest: a ranked rollup of changes. off | daily | weekly.
+    "digest": "off",
+    "digest_hour": 9,              # local hour (0–23) to send the digest
 }
 
 

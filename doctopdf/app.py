@@ -24,6 +24,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 import objc
@@ -43,7 +44,7 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSObject
 
-from . import config, drive, launchagent, pipeline, prefs, summarize
+from . import alerts, config, digest, drive, launchagent, pipeline, prefs, summarize
 from .drive import AuthFlowError, DriveError, ReauthRequired
 from .pipeline import sanitize_filename  # re-exported for convenience
 
@@ -131,6 +132,10 @@ class DocToPDFController(NSObject):
         # Repeating main-thread timer renders state onto the menu.
         self._uitimer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             1.0, self, "refreshUI:", None, True
+        )
+        # Periodic check for a due daily/weekly digest.
+        self._digesttimer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            300.0, self, "digestTick:", None, True
         )
         self.refreshUI_(None)
 
@@ -446,29 +451,68 @@ class DocToPDFController(NSObject):
                 self._recent.appendleft({"time": now, "path": str(primary), "name": name})
                 self._recent_dirty = True
 
-        if primary and self._config.get("notify"):
+        new_text = result.get("text")
+        old_text = self._prev_text.get(fid)
+        if new_text is not None:
+            self._prev_text[fid] = new_text
+        has_diff = bool(new_text and old_text is not None and old_text != new_text)
+
+        # Plain export-confirmation notification only when AI classification is
+        # OFF. When it's ON, the change handler notifies *only* on changes that
+        # pass the severity filter — which is what kills notification fatigue.
+        if primary and cfg.get("notify") and not cfg.get("ai_summary"):
             fmts = ", ".join(result.get("written", {}).keys()) or "pdf"
             self._notify(f"{name}", f"Exported {fmts} · {now}")
 
-        # AI change summary via a local model (async; never blocks the watch loop).
-        if cfg.get("ai_summary"):
-            new_text = result.get("text")
-            old_text = self._prev_text.get(fid)
-            if new_text is not None:
-                self._prev_text[fid] = new_text
-            if new_text and old_text and old_text != new_text:
-                self._summarize(name, old_text, new_text, cfg)
+        # Change intelligence: classify → filter → menu/notify/alert/log (async).
+        if has_diff:
+            self._handle_change(name, old_text, new_text, dict(cfg))
         return result.get("warning")
 
     @objc.python_method
-    def _summarize(self, name, old_text, new_text, cfg) -> None:
+    def _handle_change(self, name, old_text, new_text, cfg) -> None:
+        """Classify a change, gate it by severity, then surface + alert + log.
+
+        Runs on a daemon thread (local model + webhooks/email are network I/O);
+        never blocks the watch loop.
+        """
         def go():
-            s = summarize.summarize_change(old_text, new_text, cfg)
-            if s:
+            summary = severity = category = None
+            if cfg.get("ai_summary"):
+                cls = summarize.classify_change(old_text, new_text, cfg)
+                if cls:
+                    summary, severity, category = cls["summary"], cls["severity"], cls["category"]
+
+            if not alerts.passes(severity, cfg.get("min_severity")):
+                return  # below the alert threshold — stay quiet
+
+            now = datetime.now()
+            event = {"time": now.isoformat(timespec="seconds"), "doc": name,
+                     "summary": summary, "severity": severity, "category": category}
+
+            if summary:
                 with self._lock:
-                    self._state["last_summary"] = f"{name}: {s}"
-                self._notify(f"{name} — changed", s)
-        threading.Thread(target=go, name="doctopdf-ai", daemon=True).start()
+                    self._state["last_summary"] = f"{name}: [{severity}] {summary}"
+                self._notify(f"{name} — {severity}", summary)
+
+            warns = []
+            if alerts.any_destination(cfg):
+                tag = f" [{severity}]" if severity else ""
+                warns = alerts.dispatch(cfg, f"DocToPDF: {name} changed{tag}",
+                                        summary or "Document changed.")
+
+            if (cfg.get("digest") or "off") != "off":
+                try:
+                    digest.append(event, now)
+                except Exception:  # noqa: BLE001 — logging is best-effort
+                    pass
+
+            if warns:
+                with self._lock:
+                    self._state["warning"] = warns[0] if len(warns) == 1 else \
+                        f"{len(warns)} alert issues (e.g. {warns[0]})"
+
+        threading.Thread(target=go, name="doctopdf-change", daemon=True).start()
 
     # ----------------------------------------------------------- UI refresh
     def refreshUI_(self, _timer) -> None:
@@ -639,6 +683,21 @@ class DocToPDFController(NSObject):
             subprocess.run(["open", str(path)], check=False)
         else:
             self._alert("File missing", "That export no longer exists on disk.")
+
+    def digestTick_(self, _timer) -> None:
+        cfg = dict(self._config)
+        now = datetime.now()
+        if not digest.due(cfg, now):
+            return
+        events = digest.collect_and_mark(now)  # marks sent now → no re-fire
+        period = cfg.get("digest")
+
+        def go():
+            text = digest.build_text(events, period)
+            self._notify("DocToPDF digest", text.splitlines()[0])
+            if alerts.any_destination(cfg):
+                alerts.dispatch(cfg, f"DocToPDF {period} digest", text)
+        threading.Thread(target=go, name="doctopdf-digest", daemon=True).start()
 
     def onPreferences_(self, _sender) -> None:
         self._prefs = prefs.PreferencesController.alloc().initWithApp_(self)

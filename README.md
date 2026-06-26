@@ -7,8 +7,12 @@ seconds a fresh `~/Desktop/<Name>.pdf` (and any other formats you pick) appears.
 
 Also: **multi-format export** (pdf/docx/xlsx/pptx/md/…), **git version history**
 with text diffs, **rolling versions**, a **post-export shell hook**, macOS
-**notifications**, **launch-at-login**, and **AI change summaries** via a local
-model (no cloud key).
+**notifications**, **launch-at-login**, a tabbed **Preferences** window, and —
+the part that makes it a *monitoring* tool, not just an exporter — **AI change
+intelligence**: a local model summarizes **and classifies** each change
+(cosmetic / substantive / material), you set a **severity threshold** to cut
+noise, and alerts go to **Slack / Discord / webhooks / email** plus **scheduled
+digests**. All AI runs locally (no cloud key).
 
 ```
 DocToPDF
@@ -119,9 +123,14 @@ Settings persist to `~/Library/Application Support/DocToPDF/config.json`:
 | `git_snapshot_text` | `true` | When `git_repo` is set, also commit a text snapshot (md/csv/…) so history has real diffs. |
 | `post_export_cmd` | `null` | Shell command run after each export (see below). |
 | `notify` | `false` | Post a macOS notification on each export. |
-| `ai_summary` | `false` | On each change, summarize the edit with a **local** model (see below). |
+| `ai_summary` | `false` | On each change, summarize **and classify** the edit with a **local** model (see below). |
 | `ollama_url` | `http://localhost:11434` | Local Ollama server URL. |
-| `ollama_model` | `"llama3"` | Local model to use for summaries. |
+| `ollama_model` | `"llama3"` | Local model to use for summaries/classification. |
+| `min_severity` | `"cosmetic"` | Alert threshold: `cosmetic` < `substantive` < `material`. Raise it to cut noise. |
+| `webhook_urls` | `[]` | Slack / Discord / generic webhook URLs to alert on passing changes. |
+| `email_to` / `email_from` / `smtp_*` | `null` | Email alerts via SMTP (host, port, user, pass). |
+| `digest` | `"off"` | Ranked rollup: `off` / `daily` / `weekly`. |
+| `digest_hour` | `9` | Local hour (0–23) to send the digest. |
 
 > `doc_id` (a legacy single-doc id) is auto-migrated into `watch` on first launch.
 
@@ -205,6 +214,32 @@ ollama pull llama3                        # or any model; set "ollama_model"
 If no local model is reachable, summaries are silently skipped — watching is
 never affected. Runs asynchronously, so a slow model never delays exports.
 
+### Change intelligence — classify, filter, alert, digest
+
+This is what turns DocToPDF from "exports my docs" into "tells me what changed."
+With `ai_summary` on, each change is also **classified**:
+
+- **Severity** — `cosmetic` (formatting/typos), `substantive` (real content), or
+  `material` (affects meaning, numbers, money, dates, obligations).
+- **Category** — e.g. *pricing, legal, dates, wording, structure*.
+
+Then:
+
+- **Severity filtering** (`min_severity`) — only alert at/above a level. Set it
+  to `material` and you only hear about changes that actually matter.
+- **Alert destinations** — passing changes are pushed to Slack/Discord/generic
+  **webhooks** and **email** (SMTP), not just a local notification:
+  ```jsonc
+  { "ai_summary": true, "min_severity": "substantive",
+    "webhook_urls": ["https://hooks.slack.com/services/…"] }
+  ```
+- **Scheduled digests** (`digest`: `daily`/`weekly`) — a rollup of everything
+  that changed across all watched sources, **ranked by severity**, sent at
+  `digest_hour`, alongside (or instead of) real-time alerts.
+
+Everything's configurable from the **Change Alerts** tab in Preferences. The
+change log lives at `~/Library/Application Support/DocToPDF/events.json`.
+
 ---
 
 ## Behavior & limits
@@ -257,8 +292,10 @@ doctopdf/
   app.py         # native AppKit menu bar: status item, menu, multi-target watch loop
   drive.py       # Google auth + Drive get/list/export helpers
   pipeline.py    # export pipeline: type-aware formats, output modes, git history, hook
-  summarize.py   # local-model (Ollama) AI change summaries
-  prefs.py       # native Preferences window
+  summarize.py   # local-model (Ollama) change summary + severity/category classify
+  alerts.py      # severity gating + Slack/Discord/webhook/email dispatch
+  digest.py      # change-event log + scheduled daily/weekly digests
+  prefs.py       # native tabbed Preferences window
   launchagent.py # install/remove the launch-at-login LaunchAgent
   config.py      # config load/save + token/config paths
 requirements.txt
