@@ -107,6 +107,7 @@ class DocToPDFController(NSObject):
             "last_export_time": None,
             "error_msg": None,              # fatal: shown with the ⚠️ menu-bar glyph
             "warning": None,                # non-fatal (git/hook): export still succeeded
+            "last_summary": None,           # latest AI change summary (menu line)
             "last_pdf_path": None,
         }
 
@@ -157,6 +158,8 @@ class DocToPDFController(NSObject):
         self._mi_last = disabled("Last export: —")
         self._mi_warn = disabled("")        # non-fatal warning line, hidden unless set
         self._mi_warn.setHidden_(True)
+        self._mi_summary = disabled("")     # latest AI change summary, hidden unless set
+        self._mi_summary.setHidden_(True)
 
         # "Watching ▸" submenu lists each watched doc/folder (click to remove).
         self._watch_menu = NSMenu.alloc().init()
@@ -460,6 +463,8 @@ class DocToPDFController(NSObject):
         def go():
             s = summarize.summarize_change(old_text, new_text, cfg)
             if s:
+                with self._lock:
+                    self._state["last_summary"] = f"{name}: {s}"
                 self._notify(f"{name} — changed", s)
         threading.Thread(target=go, name="doctopdf-ai", daemon=True).start()
 
@@ -520,6 +525,14 @@ class DocToPDFController(NSObject):
             self._mi_warn.setHidden_(False)
         else:
             self._mi_warn.setHidden_(True)
+
+        # Latest AI change summary, pinned in the menu (hidden until one exists).
+        summ = st.get("last_summary")
+        if summ:
+            self._mi_summary.setTitle_(f"💡 {summ if len(summ) <= 90 else summ[:88] + '…'}")
+            self._mi_summary.setHidden_(False)
+        else:
+            self._mi_summary.setHidden_(True)
 
         # "Launch at Login" checkmark reflects whether the LaunchAgent is installed.
         self._mi_login.setState_(
