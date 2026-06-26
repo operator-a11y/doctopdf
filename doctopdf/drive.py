@@ -204,10 +204,11 @@ def _call(fn: Callable, file_id: str):
 
 
 def get_file_metadata(service, file_id: str) -> dict:
-    """Return ``{id, name, modifiedTime, mimeType}`` for the file."""
+    """Return ``{id, name, modifiedTime, mimeType, lastModifyingUser}`` for the file."""
     return _call(
         lambda: service.files()
-        .get(fileId=file_id, fields="id, name, modifiedTime, mimeType")
+        .get(fileId=file_id,
+             fields="id, name, modifiedTime, mimeType, lastModifyingUser(displayName, emailAddress)")
         .execute(),
         file_id,
     )
@@ -225,7 +226,8 @@ def list_folder(service, folder_id: str) -> list[dict]:
                 service.files()
                 .list(
                     q=f"'{folder_id}' in parents and trashed = false",
-                    fields="nextPageToken, files(id, name, modifiedTime, mimeType)",
+                    fields="nextPageToken, files(id, name, modifiedTime, mimeType, "
+                           "lastModifyingUser(displayName))",
                     pageSize=200,
                     orderBy="name",
                     pageToken=token,

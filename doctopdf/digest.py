@@ -84,6 +84,12 @@ def due(cfg: dict, now: datetime) -> bool:
     return (now.date() - last.date()).days >= 7   # weekly
 
 
+def all_events() -> list[dict]:
+    """Return the full change-event log (for the audit dashboard)."""
+    with _LOCK:
+        return list(_load().get("events", []))
+
+
 def peek_since(now: datetime) -> list[dict]:
     """Return events since the last digest WITHOUT marking sent."""
     with _LOCK:

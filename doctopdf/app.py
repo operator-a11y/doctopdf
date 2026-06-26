@@ -45,7 +45,8 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSObject
 
-from . import alerts, config, digest, drive, launchagent, pipeline, prefs, summarize, web
+from . import (alerts, audit, config, digest, drive, launchagent, pipeline, prefs,
+               summarize, web)
 from .drive import AuthFlowError, DriveError, ReauthRequired
 from .pipeline import sanitize_filename  # re-exported for convenience
 
@@ -199,6 +200,7 @@ class DocToPDFController(NSObject):
         menu.addItem_(NSMenuItem.separatorItem())
         self._mi_pause = action("Pause", "onTogglePause:")
         action("Add Doc or Folder…", "onAddTarget:")
+        action("Change history…", "onAuditHistory:")
         action("Preferences…", "onPreferences:")
         self._mi_login = action("Launch at Login", "onToggleLogin:")
         menu.addItem_(NSMenuItem.separatorItem())
@@ -342,12 +344,16 @@ class DocToPDFController(NSObject):
         """
         targets, entry_names, errors, seen = [], {}, [], set()
 
-        def add(fid, name, modified, gtype, overrides):
+        def add(fid, name, modified, gtype, overrides, who=None):
             if fid in seen:
                 return
             seen.add(fid)
             targets.append({"kind": "drive", "id": fid, "name": name or fid,
-                            "modified": modified, "gtype": gtype, "overrides": overrides})
+                            "modified": modified, "gtype": gtype, "overrides": overrides,
+                            "who": who})
+
+        def editor(m):
+            return (m.get("lastModifyingUser") or {}).get("displayName")
 
         for entry in watch:
             # Web target — no Drive call; the change signal is the content hash.
@@ -386,11 +392,11 @@ class DocToPDFController(NSObject):
                         cgt = pipeline.google_type(child.get("mimeType"))
                         if cgt in pipeline.FORMATS_BY_TYPE:
                             add(child["id"], child.get("name"), child.get("modifiedTime"),
-                                cgt, overrides)
+                                cgt, overrides, editor(child))
                             n += 1
                     entry_names[fid] = f"📁 {label} ({n})"
                 elif gtype in pipeline.FORMATS_BY_TYPE:
-                    add(fid, label, meta.get("modifiedTime"), gtype, overrides)
+                    add(fid, label, meta.get("modifiedTime"), gtype, overrides, editor(meta))
                     entry_names[fid] = label
                 else:
                     entry_names[fid] = f"{label} (unsupported)"
@@ -503,7 +509,7 @@ class DocToPDFController(NSObject):
 
         # Change intelligence: classify → filter → menu/notify/alert/log (async).
         if has_diff:
-            self._handle_change(name, old_text, new_text, dict(cfg))
+            self._handle_change(name, old_text, new_text, dict(cfg), who=t.get("who"))
         return result.get("warning")
 
     @objc.python_method
@@ -586,7 +592,7 @@ class DocToPDFController(NSObject):
         return path
 
     @objc.python_method
-    def _handle_change(self, name, old_text, new_text, cfg) -> None:
+    def _handle_change(self, name, old_text, new_text, cfg, who=None) -> None:
         """Classify a change, gate it by severity, then surface + alert + log.
 
         Runs on a daemon thread (local model + webhooks/email are network I/O);
@@ -627,7 +633,8 @@ class DocToPDFController(NSObject):
                 if passed:
                     now = datetime.now()
                     event = {"time": now.isoformat(timespec="seconds"), "doc": name,
-                             "summary": summary, "severity": severity, "category": category}
+                             "summary": summary, "severity": severity, "category": category,
+                             "who": who}
                     # The change notification (the plain export one was suppressed).
                     if cfg.get("ai_summary") and not degraded:
                         self._notify(f"{name} — {severity}", summary or "Document changed.")
@@ -638,11 +645,12 @@ class DocToPDFController(NSObject):
                         tag = f" [{severity}]" if severity else ""
                         warns = alerts.dispatch(cfg, f"DocToPDF: {name} changed{tag}",
                                                 summary or "Document changed.")
-                    if (cfg.get("digest") or "off") != "off":
-                        try:
-                            digest.append(event, now)
-                        except Exception:  # noqa: BLE001 — logging is best-effort
-                            pass
+                    # Always log to the change-event audit trail (the digest and the
+                    # Change-history dashboard both read it).
+                    try:
+                        digest.append(event, now)
+                    except Exception:  # noqa: BLE001 — logging is best-effort
+                        pass
 
                 # Clear/refresh the warning line on a clean (non-degraded) result.
                 if not degraded:
@@ -871,6 +879,13 @@ class DocToPDFController(NSObject):
             if ok:
                 digest.mark_sent(now)
         threading.Thread(target=go, name="doctopdf-digest", daemon=True).start()
+
+    def onAuditHistory_(self, _sender) -> None:
+        try:
+            path = audit.write_report(digest.all_events(), time.strftime("%Y-%m-%d %H:%M:%S"))
+            subprocess.run(["open", str(path)], check=False)
+        except Exception as exc:  # noqa: BLE001
+            self._alert("Couldn't open history", str(exc))
 
     def onPreferences_(self, _sender) -> None:
         self._prefs = prefs.PreferencesController.alloc().initWithApp_(self)

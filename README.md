@@ -91,7 +91,8 @@ Google authorization. Then:
 | **Reveal in Finder** | Select the most recent export in Finder. |
 | **Recent exports ▸** | The last 15 exports; click any to open it. |
 | **Pause / Resume** | Stop/start the watch loop. |
-| **Add Doc or Folder…** | Add a doc, sheet, slides, or folder to the watch list. |
+| **Add Doc or Folder…** | Add a doc, sheet, slides, folder, or web page to the watch list. |
+| **Change history…** | Open a browsable audit log: what changed, when, by whom, how severe. |
 | **Preferences…** | A window to adjust all settings (no JSON editing needed). |
 | **Launch at Login** | Toggle auto-start at login (✓ when on). |
 | **Quit** | Exit the app. |
@@ -240,8 +241,10 @@ Then:
   that changed across all watched sources, **ranked by severity**, sent at
   `digest_hour`, alongside (or instead of) real-time alerts.
 
-Everything's configurable from the **Change Alerts** tab in Preferences. The
-change log lives at `~/Library/Application Support/DocToPDF/events.json`.
+Everything's configurable from the **Change Alerts** tab in Preferences. Every
+change is recorded to `~/Library/Application Support/DocToPDF/events.json`, and
+**Change history…** opens a browsable audit dashboard of it — what changed, when,
+by whom (Drive's last editor), and how severe — filterable and sortable.
 
 ### Monitor web pages
 
