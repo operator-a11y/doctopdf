@@ -46,17 +46,18 @@ def _post_json(url: str, payload: dict) -> None:
         pass
 
 
-def _webhook_payload(url: str, text: str) -> dict:
+def _webhook_payload(url: str, subject: str, body: str) -> dict:
     u = url.lower()
     if "discord.com" in u or "discordapp.com" in u:
-        return {"content": text}          # Discord incoming webhook
-    # Slack incoming webhooks and most generic receivers accept {"text": …}.
-    return {"text": text}
+        return {"content": f"**{subject}**\n{body}"}     # Discord markdown
+    if "hooks.slack.com" in u or "slack.com" in u:
+        return {"text": f"*{subject}*\n{body}"}           # Slack mrkdwn
+    return {"text": f"{subject}\n{body}"}                  # generic — no markup
 
 
-def send_webhook(url: str, text: str) -> Optional[str]:
+def send_webhook(url: str, subject: str, body: str) -> Optional[str]:
     try:
-        _post_json(url, _webhook_payload(url, text))
+        _post_json(url, _webhook_payload(url, subject, body))
         return None
     except (urllib.error.URLError, OSError, ValueError) as exc:
         return f"webhook {url[:40]}…: {exc}"
@@ -77,7 +78,10 @@ def send_email(cfg: dict, subject: str, body: str) -> Optional[str]:
     msg["From"] = cfg.get("email_from") or cfg.get("smtp_user") or to
     msg["To"] = to
     msg.set_content(body)
-    port = int(cfg.get("smtp_port") or 587)
+    try:
+        port = int(cfg.get("smtp_port") or 587)
+    except (TypeError, ValueError):
+        port = 587
     user, pw = cfg.get("smtp_user"), cfg.get("smtp_pass")
     try:
         if port == 465:
@@ -89,11 +93,17 @@ def send_email(cfg: dict, subject: str, body: str) -> Optional[str]:
         else:
             with smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT) as s:
                 s.ehlo()
+                secured = False
                 try:
                     s.starttls(context=ssl.create_default_context())
                     s.ehlo()
+                    secured = True
                 except smtplib.SMTPException:
-                    pass  # server without STARTTLS
+                    pass  # server didn't offer STARTTLS
+                # Never hand credentials to a cleartext channel (STARTTLS-strip).
+                if user and not secured:
+                    return ("email: refusing to send credentials unencrypted "
+                            "(STARTTLS unavailable) — use port 465 or a TLS server")
                 if user:
                     s.login(user, pw or "")
                 s.send_message(msg)
@@ -114,7 +124,7 @@ def dispatch(cfg: dict, subject: str, body: str) -> list[str]:
     for url in (cfg.get("webhook_urls") or []):
         url = str(url).strip()
         if url:
-            w = send_webhook(url, f"*{subject}*\n{body}")
+            w = send_webhook(url, subject, body)
             if w:
                 warnings.append(w)
     w = send_email(cfg, subject, body)

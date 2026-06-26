@@ -95,6 +95,7 @@ class DocToPDFController(NSObject):
             config.save_config(self._config)
         self._modified: dict = {}           # file id -> last seen Drive modifiedTime
         self._prev_text: dict = {}          # file id -> last exported text (for AI diffs)
+        self._inflight: set = set()         # doc names with a change being processed
         self._entry_names: dict = {}        # watch-entry id -> menu label
         self._watch_sig = None              # last-rendered watch submenu signature
         self._interval = self._base_interval
@@ -108,6 +109,7 @@ class DocToPDFController(NSObject):
             "last_export_time": None,
             "error_msg": None,              # fatal: shown with the ⚠️ menu-bar glyph
             "warning": None,                # non-fatal (git/hook): export still succeeded
+            "alert_warning": None,          # async alert/classify degradation (not poll-cleared)
             "last_summary": None,           # latest AI change summary (menu line)
             "last_pdf_path": None,
         }
@@ -474,43 +476,69 @@ class DocToPDFController(NSObject):
         """Classify a change, gate it by severity, then surface + alert + log.
 
         Runs on a daemon thread (local model + webhooks/email are network I/O);
-        never blocks the watch loop.
+        never blocks the watch loop. Coalesces per doc so a fast series of edits
+        can't pile up overlapping model/alert threads.
         """
+        with self._lock:
+            if name in self._inflight:
+                return  # a change for this doc is already being processed
+            self._inflight.add(name)
+
         def go():
-            summary = severity = category = None
-            if cfg.get("ai_summary"):
-                cls = summarize.classify_change(old_text, new_text, cfg)
-                if cls:
-                    summary, severity, category = cls["summary"], cls["severity"], cls["category"]
+            try:
+                summary = severity = category = None
+                degraded = False
+                if cfg.get("ai_summary"):
+                    cls = summarize.classify_change(old_text, new_text, cfg)
+                    if cls:
+                        summary, severity, category = cls["summary"], cls["severity"], cls["category"]
+                    else:
+                        # Model enabled but unreachable/failed. We can't classify,
+                        # so we must NOT go silent (that hides real changes from a
+                        # user relying on alerts). Fail open: 'substantive' for
+                        # external gating, and always surface locally + warn.
+                        severity, degraded = "substantive", True
 
-            if not alerts.passes(severity, cfg.get("min_severity")):
-                return  # below the alert threshold — stay quiet
+                # A model outage is always surfaced locally + on the warning line,
+                # regardless of threshold — otherwise a raised threshold + outage =
+                # total silence on changes that might be material.
+                if degraded:
+                    self._notify(f"{name} — changed",
+                                 "Local model offline — couldn't classify this change.")
+                    with self._lock:
+                        self._state["alert_warning"] = "Local model unavailable — change not classified."
 
-            now = datetime.now()
-            event = {"time": now.isoformat(timespec="seconds"), "doc": name,
-                     "summary": summary, "severity": severity, "category": category}
+                passed = alerts.passes(severity, cfg.get("min_severity"))
+                warns = []
+                if passed:
+                    now = datetime.now()
+                    event = {"time": now.isoformat(timespec="seconds"), "doc": name,
+                             "summary": summary, "severity": severity, "category": category}
+                    # The change notification (the plain export one was suppressed).
+                    if cfg.get("ai_summary") and not degraded:
+                        self._notify(f"{name} — {severity}", summary or "Document changed.")
+                        if summary:
+                            with self._lock:
+                                self._state["last_summary"] = f"{name}: [{severity}] {summary}"
+                    if alerts.any_destination(cfg):
+                        tag = f" [{severity}]" if severity else ""
+                        warns = alerts.dispatch(cfg, f"DocToPDF: {name} changed{tag}",
+                                                summary or "Document changed.")
+                    if (cfg.get("digest") or "off") != "off":
+                        try:
+                            digest.append(event, now)
+                        except Exception:  # noqa: BLE001 — logging is best-effort
+                            pass
 
-            if summary:
+                # Clear/refresh the warning line on a clean (non-degraded) result.
+                if not degraded:
+                    note = (warns[0] if len(warns) == 1 else
+                            f"{len(warns)} alert issues (e.g. {warns[0]})") if warns else None
+                    with self._lock:
+                        self._state["alert_warning"] = note
+            finally:
                 with self._lock:
-                    self._state["last_summary"] = f"{name}: [{severity}] {summary}"
-                self._notify(f"{name} — {severity}", summary)
-
-            warns = []
-            if alerts.any_destination(cfg):
-                tag = f" [{severity}]" if severity else ""
-                warns = alerts.dispatch(cfg, f"DocToPDF: {name} changed{tag}",
-                                        summary or "Document changed.")
-
-            if (cfg.get("digest") or "off") != "off":
-                try:
-                    digest.append(event, now)
-                except Exception:  # noqa: BLE001 — logging is best-effort
-                    pass
-
-            if warns:
-                with self._lock:
-                    self._state["warning"] = warns[0] if len(warns) == 1 else \
-                        f"{len(warns)} alert issues (e.g. {warns[0]})"
+                    self._inflight.discard(name)
 
         threading.Thread(target=go, name="doctopdf-change", daemon=True).start()
 
@@ -564,8 +592,10 @@ class DocToPDFController(NSObject):
             self._rebuild_watch_menu(watch_entries, entry_names)
             self._watch_sig = sig
 
-        # Non-fatal git/hook warning: shown on its own line, not as the error glyph.
-        warn = st.get("warning")
+        # Non-fatal warnings (git/hook + async alert/classify degradation), shown
+        # on their own line — not the error glyph. alert_warning isn't cleared by
+        # the poll loop, so it persists until the next successful change.
+        warn = " · ".join(w for w in (st.get("warning"), st.get("alert_warning")) if w)
         if warn:
             self._mi_warn.setTitle_(f"⚠️ {warn}")
             self._mi_warn.setHidden_(False)
@@ -689,14 +719,19 @@ class DocToPDFController(NSObject):
         now = datetime.now()
         if not digest.due(cfg, now):
             return
-        events = digest.collect_and_mark(now)  # marks sent now → no re-fire
+        events = digest.peek_since(now)        # read without marking yet
         period = cfg.get("digest")
 
         def go():
             text = digest.build_text(events, period)
             self._notify("DocToPDF digest", text.splitlines()[0])
+            # Mark the window sent only if external delivery succeeded (or there
+            # are no external destinations), so a webhook/email outage retries.
+            ok = True
             if alerts.any_destination(cfg):
-                alerts.dispatch(cfg, f"DocToPDF {period} digest", text)
+                ok = not alerts.dispatch(cfg, f"DocToPDF {period} digest", text)
+            if ok:
+                digest.mark_sent(now)
         threading.Thread(target=go, name="doctopdf-digest", daemon=True).start()
 
     def onPreferences_(self, _sender) -> None:
@@ -707,6 +742,12 @@ class DocToPDFController(NSObject):
     def apply_prefs(self, cfg: dict) -> None:
         """Persist + apply preferences live (most settings the worker reads each
         poll; poll_interval needs the base interval updated)."""
+        # Only re-export immediately if a setting affecting OUTPUT changed —
+        # otherwise a Save would write spurious timestamped/rolling versions of
+        # unchanged docs (and needlessly re-run git/hook).
+        out_keys = ("formats", "output_dir", "timestamped", "keep_versions",
+                    "git_repo", "git_snapshot_text")
+        changed = any(self._config.get(k) != cfg.get(k) for k in out_keys)
         with self._lock:
             self._config.update(cfg)
             try:
@@ -714,9 +755,11 @@ class DocToPDFController(NSObject):
             except (TypeError, ValueError):
                 pass
             self._interval = self._base_interval
-            self._force = True  # re-export so new formats/outputs take effect now
+            if changed:
+                self._force = True  # re-export so new formats/outputs take effect now
         config.save_config(self._config)
-        self._wake.set()
+        if changed:
+            self._wake.set()
 
     def onToggleLogin_(self, _sender) -> None:
         try:

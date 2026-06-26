@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -20,6 +21,10 @@ from .alerts import SEVERITY_RANK
 EVENTS_PATH = config.APP_SUPPORT_DIR / "events.json"
 PRUNE_DAYS = 90        # drop events older than this
 MAX_EVENTS = 5000      # hard cap
+
+# Serializes every read-modify-write of events.json (append runs on change
+# threads; the digest tick reads/marks on the main thread).
+_LOCK = threading.Lock()
 
 
 def _load() -> dict:
@@ -52,14 +57,15 @@ def _parse(ts: Optional[str]) -> Optional[datetime]:
 
 def append(event: dict, now: datetime) -> None:
     """Append a change event (``{time, doc, summary, severity, category}``)."""
-    data = _load()
-    data["events"].append(event)
-    cutoff = now - timedelta(days=PRUNE_DAYS)
-    data["events"] = [
-        e for e in data["events"]
-        if (_parse(e.get("time")) or now) >= cutoff
-    ][-MAX_EVENTS:]
-    _save(data)
+    with _LOCK:
+        data = _load()
+        data["events"].append(event)
+        cutoff = now - timedelta(days=PRUNE_DAYS)
+        data["events"] = [
+            e for e in data["events"]
+            if (_parse(e.get("time")) or now) >= cutoff
+        ][-MAX_EVENTS:]
+        _save(data)
 
 
 def due(cfg: dict, now: datetime) -> bool:
@@ -69,47 +75,53 @@ def due(cfg: dict, now: datetime) -> bool:
         return False
     if now.hour < int(cfg.get("digest_hour", 9) or 0):
         return False
-    last = _parse(_load().get("last_digest"))
+    with _LOCK:
+        last = _parse(_load().get("last_digest"))
     if last is None:
         return True
-    interval = timedelta(days=1 if mode == "daily" else 7)
-    # Require a new calendar day AND the minimum interval elapsed.
-    return now.date() != last.date() and (now - last) >= interval
+    if mode == "daily":
+        return now.date() != last.date()         # once per calendar day, post-hour
+    return (now.date() - last.date()).days >= 7   # weekly
 
 
-def collect_and_mark(now: datetime) -> list[dict]:
-    """Return events since the last digest and record that a digest was sent."""
-    data = _load()
+def peek_since(now: datetime) -> list[dict]:
+    """Return events since the last digest WITHOUT marking sent."""
+    with _LOCK:
+        data = _load()
     last = _parse(data.get("last_digest"))
-    events = [
+    return [
         e for e in data["events"]
         if last is None or (_parse(e.get("time")) or now) > last
     ]
-    data["last_digest"] = now.isoformat(timespec="seconds")
-    _save(data)
-    return events
+
+
+def mark_sent(now: datetime) -> None:
+    """Record that a digest was delivered (called only after a successful send)."""
+    with _LOCK:
+        data = _load()
+        data["last_digest"] = now.isoformat(timespec="seconds")
+        _save(data)
 
 
 def build_text(events: list[dict], period: str) -> str:
     """Format a digest, ranked by severity (material first)."""
     if not events:
         return f"DocToPDF {period} digest: no changes."
-    events = sorted(
-        events,
-        key=lambda e: (-SEVERITY_RANK.get((e.get("severity") or "substantive"), 1),
-                       e.get("time") or ""),
-    )
+    def sev_of(e):  # normalize a missing/None severity consistently
+        return e.get("severity") or "substantive"
+
+    events = sorted(events, key=lambda e: (-SEVERITY_RANK.get(sev_of(e), 1),
+                                           e.get("time") or ""))
     counts = {"material": 0, "substantive": 0, "cosmetic": 0}
     for e in events:
-        counts[e.get("severity") or "substantive"] = counts.get(e.get("severity") or "substantive", 0) + 1
+        counts[sev_of(e)] = counts.get(sev_of(e), 0) + 1
     head = (f"DocToPDF {period} digest — {len(events)} change(s): "
             f"{counts['material']} material, {counts['substantive']} substantive, "
             f"{counts['cosmetic']} cosmetic.")
     lines = [head, ""]
     for e in events:
-        sev = (e.get("severity") or "?")
         when = (e.get("time") or "")[:16].replace("T", " ")
         cat = e.get("category")
-        tag = f"[{sev}{'/' + cat if cat else ''}]"
+        tag = f"[{sev_of(e)}{'/' + cat if cat else ''}]"
         lines.append(f"• {tag} {e.get('doc', '?')}: {e.get('summary') or 'changed'}  ({when})")
     return "\n".join(lines)

@@ -111,6 +111,11 @@ def save_config(config: dict[str, Any]) -> None:
     with open(tmp_path, "w", encoding="utf-8") as fh:
         json.dump(to_store, fh, indent=2)
     os.replace(tmp_path, CONFIG_PATH)  # atomic on POSIX
+    # Config can hold an SMTP password — keep it owner-only.
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
 
 
 def resolve_output_dir(config: dict[str, Any]) -> Path:

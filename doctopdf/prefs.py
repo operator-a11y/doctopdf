@@ -187,7 +187,7 @@ class PreferencesController(NSObject):
                           if f.strip()] or list(d["formats"])
         cfg["notify"] = bool(self.notify.state())
         cfg["timestamped"] = bool(self.timestamped.state())
-        cfg["keep_versions"] = as_int(self.keep, 0, 0)
+        cfg["keep_versions"] = as_int(self.keep, cfg.get("keep_versions", 0), 0)
         cfg["git_repo"] = (text(self.gitrepo, "~/Documents/DocToPDF-history")
                            if self.git.state() else None)
         cfg["git_snapshot_text"] = bool(self.gitsnap.state())
@@ -200,11 +200,11 @@ class PreferencesController(NSObject):
         cfg["email_to"] = text(self.email_to)
         cfg["email_from"] = text(self.email_from)
         cfg["smtp_host"] = text(self.smtp_host)
-        cfg["smtp_port"] = as_int(self.smtp_port, 587, 1)
+        cfg["smtp_port"] = as_int(self.smtp_port, cfg.get("smtp_port", 587), 1)
         cfg["smtp_user"] = text(self.smtp_user)
         cfg["smtp_pass"] = self.smtp_pass.stringValue() or None
         cfg["digest"] = self.digest.titleOfSelectedItem() or "off"
-        cfg["digest_hour"] = min(23, as_int(self.digest_hour, 9, 0))
+        cfg["digest_hour"] = min(23, as_int(self.digest_hour, cfg.get("digest_hour", 9), 0))
         cfg["post_export_cmd"] = self.hook.stringValue().strip() or None
 
         # Launch-at-login is managed via the LaunchAgent, not config.
