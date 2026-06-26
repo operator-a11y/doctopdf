@@ -281,6 +281,74 @@ diffed; a real content change flows into the *exact same* pipeline as a Doc chan
 
 ---
 
+### Knowledge base — RAG vector sync + MCP (always-current context for agents)
+
+Every watched source (Doc / Sheet / Slides / Drive folder / web page) is chunked,
+embedded, and kept current in a **local vector store**, so an LLM or agent always
+has the *present* content. Because DocToPDF already detects changes, re-embedding
+is **incremental** — a one-line edit re-embeds *one chunk*, not the whole document
+(chunks are reconciled by content hash). Removing a target (or a folder child)
+deletes its chunks.
+
+```jsonc
+"rag": {
+  "enabled": true,
+  "store_path": "~/Documents/DocExports/.vectorstore",   // local; gitignored
+  "embedder": { "provider": "ollama", "model": "nomic-embed-text", "url": "http://localhost:11434" },
+  "chunk": { "size": 1000, "overlap": 150 },
+  "mcp": { "enabled": true }
+}
+```
+
+Per-target opt-out: add `"rag": false` to any watch entry to watch it for alerts
+but keep it out of the knowledge base.
+
+**Setup (local embeddings):**
+
+```bash
+ollama pull nomic-embed-text     # the default local embedder
+```
+
+**Query it from the CLI** (top-k chunks with source + freshness):
+
+```bash
+python -m doctopdf query "what is the current Pro price?" -k 5
+```
+
+**Use it from an agent (MCP server).** It exposes one read-only tool,
+`search_knowledge(query, k=5)`, returning current chunks with a citation (name,
+link) and `updated_at` so the agent can say *"from <name>, updated <date>: …"*.
+Register it with an MCP client (Claude Desktop / Claude Code):
+
+```jsonc
+{
+  "mcpServers": {
+    "doctopdf": {
+      "command": "/absolute/path/to/doctopdf/.venv/bin/python",
+      "args": ["-m", "doctopdf", "mcp"]
+    }
+  }
+}
+```
+
+- **Always current:** the store tracks live content — on restart every target is
+  re-baselined (and hash-reconciled), so the index self-heals; a sync that failed
+  while the embedder was down is recovered then too.
+- **Graceful + additive:** if Ollama is down or the model is missing, syncs queue
+  and the menu shows it — exports and alerts are never blocked. The menu shows the
+  indexed-chunk count, last sync, and a **Rebuild index** action.
+- **Changing the embedder model** changes the vector dimension, which would corrupt
+  search — DocToPDF refuses to mix and asks you to rebuild:
+  ```bash
+  python -m doctopdf rag reindex   # then the app re-embeds on its next cycle
+  ```
+- **Privacy:** with the default Ollama embedder + local Chroma store, *content
+  never leaves the machine*. Selecting a cloud embedder
+  (`"provider": "openai"`, `"text-embedding-3-small"`) is the only thing that
+  sends document text off-box; it's opt-in.
+
+---
+
 ## Behavior & limits
 
 - **Overwrite by default**: the same `<DocName>.pdf` is rewritten each change, so
@@ -335,9 +403,14 @@ doctopdf/
   summarize.py   # local-model (Ollama) change summary + severity/category classify
   alerts.py      # severity gating + Slack/Discord/webhook/email dispatch
   digest.py      # change-event log + scheduled daily/weekly digests
+  audit.py       # Change-history dashboard (HTML report over the event log)
+  rag.py         # change-aware vector sync: chunk → embed → Chroma upsert/delete + query
+  mcp_server.py  # read-only MCP server exposing search_knowledge over stdio
+  __main__.py    # CLI: python -m doctopdf [app | query | mcp | rag reindex]
   prefs.py       # native tabbed Preferences window
   launchagent.py # install/remove the launch-at-login LaunchAgent
   config.py      # config load/save + token/config paths
+tests/test_rag.py
 requirements.txt
 launchd/com.doctopdf.agent.plist
 README.md
