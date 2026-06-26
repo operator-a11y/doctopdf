@@ -220,9 +220,12 @@ def git_publish(repo: str, branch: str, files: dict, message: str) -> Optional[s
     _ensure_clone(workdir, repo, branch)
     _git(workdir, "pull", "--rebase", "origin", branch, check=False)  # best-effort fast-forward
 
+    wd = workdir.resolve()
     for rel, data in files.items():
-        dest = workdir / rel
-        if PUBLISH_DIR not in dest.resolve().parents and dest.resolve() != (workdir / rel).resolve():
+        dest = (workdir / rel).resolve()
+        # Keep a misconfigured/relative ``path`` inside the working copy — a
+        # ``../`` would otherwise write outside it and break the commit.
+        if dest != wd and wd not in dest.parents:
             raise PublishError(f"unsafe publish path: {rel}")
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".tmp")

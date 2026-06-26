@@ -108,6 +108,11 @@ class SafeGitPushTests(unittest.TestCase):
         with self.assertRaises(publish.PublishError):
             publish.git_publish("", "gh-pages", {"i": b"x"}, "m")
 
+    def test_path_traversal_rejected(self):
+        with self.assertRaises(publish.PublishError):
+            publish.git_publish(str(self.remote), "gh-pages",
+                                {"../escape.html": b"x"}, "m")
+
 
 # ---------------------------------------------------------------------------
 # Manual-approval gate (app publish worker, fake publisher)
