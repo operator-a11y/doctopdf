@@ -1,12 +1,19 @@
-name: Build macOS app
+name: Build macOS app (universal2)
 
-# Push a version tag (e.g. `git tag v0.2.0 && git push origin v0.2.0`) and this
-# builds the .app on an Apple-silicon runner and attaches DocToPDF-macos.zip to
-# the GitHub Release for that tag. The asset name is stable, so the website's
-# /releases/latest/download/DocToPDF-macos.zip button always serves the newest.
+# Builds a UNIVERSAL2 (.app for arm64 + x86_64) bundle so it runs natively on
+# both Apple-silicon and Intel Macs.
 #
-# This produces an UNSIGNED build. To ship a notarized, Gatekeeper-clean app,
-# add signing/notarization secrets + steps — see packaging/PUBLISHING.md.
+# - Manual run (workflow_dispatch): builds + verifies universal2, no upload.
+#   Use this to validate the build.
+# - Tag push (v*): builds + verifies, then attaches DocToPDF-macos.zip to that
+#   tag's GitHub Release. The asset name is stable, so the website's
+#   /releases/latest/download/DocToPDF-macos.zip button always serves the newest.
+#
+# universal2 requires a universal2 Python + universal2 wheels for native deps
+# (pyobjc, nh3 — all publish universal2 wheels). We install the python.org
+# universal2 framework Python (the runner's default Python may be single-arch).
+#
+# Still UNSIGNED — see packaging/PUBLISHING.md for notarization + OAuth steps.
 
 on:
   push:
@@ -17,23 +24,33 @@ on:
 permissions:
   contents: write
 
+env:
+  PY_VER: "3.12.8"
+
 jobs:
   build:
-    runs-on: macos-14 # Apple silicon
+    runs-on: macos-14 # Apple silicon; we cross-build x86_64 into the bundle
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install build deps
-        # Lean set: only what the bundle actually includes. The heavy optional
-        # deps (chromadb / playwright / trafilatura) are excluded in setup.py and
-        # the app degrades gracefully without them.
+      - name: Install universal2 Python from python.org
         run: |
-          python -m pip install --upgrade pip
-          pip install \
+          set -euo pipefail
+          curl -fsSL -o /tmp/python.pkg \
+            "https://www.python.org/ftp/python/${PY_VER}/python-${PY_VER}-macos11.pkg"
+          sudo installer -pkg /tmp/python.pkg -target /
+          PYBIN=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12
+          echo "PYBIN=$PYBIN" >> "$GITHUB_ENV"
+          echo "interpreter archs:"; lipo -archs "$PYBIN" || file "$PYBIN"
+
+      - name: Create build venv + install universal2 wheels
+        run: |
+          set -euo pipefail
+          "$PYBIN" -m venv /tmp/bv
+          /tmp/bv/bin/python -m pip install --upgrade pip
+          # Only the deps the bundle actually includes; pip selects universal2
+          # wheels automatically on a universal2 interpreter.
+          /tmp/bv/bin/pip install \
             pyobjc-framework-Cocoa \
             google-api-python-client \
             google-auth-oauthlib \
@@ -43,13 +60,33 @@ jobs:
             "nh3>=0.2" \
             py2app
 
-      - name: Build .app
-        run: python setup.py py2app
+      - name: Build universal2 .app
+        # Belt-and-suspenders: build any compiled stub for both arches too.
+        run: ARCHFLAGS="-arch x86_64 -arch arm64" /tmp/bv/bin/python setup.py py2app
+
+      - name: Verify the bundle is universal2
+        run: |
+          set -euo pipefail
+          BIN="dist/DocToPDF.app/Contents/MacOS/DocToPDF"
+          echo "main executable: $(lipo -archs "$BIN")"
+          PYLIB="$(find dist/DocToPDF.app -path '*Python.framework*' -name Python | head -1)"
+          [ -n "$PYLIB" ] && echo "embedded python: $(lipo -archs "$PYLIB")"
+          ok=1
+          for f in "$BIN" "$PYLIB"; do
+            [ -z "$f" ] && continue
+            a="$(lipo -archs "$f")"
+            echo "$a" | grep -q x86_64 && echo "$a" | grep -q arm64 || ok=0
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::bundle is NOT universal2 (missing an architecture)"; exit 1
+          fi
+          echo "✓ universal2 confirmed"
 
       - name: Zip bundle
         run: ditto -c -k --keepParent dist/DocToPDF.app dist/DocToPDF-macos.zip
 
       - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/DocToPDF-macos.zip
