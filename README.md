@@ -92,6 +92,7 @@ Google authorization. Then:
 | **Recent exports ▸** | The last 15 exports; click any to open it. |
 | **Pause / Resume** | Stop/start the watch loop. |
 | **Add Doc or Folder…** | Add a doc, sheet, slides, folder, or web page to the watch list. |
+| **Accounts ▸** | Authorized Google accounts (✓ default, ⚠️ needs re-auth); add, remove, or set default. |
 | **Change history…** | Open a browsable audit log: what changed, when, by whom, how severe. |
 | **Preferences…** | A window to adjust all settings (no JSON editing needed). |
 | **Launch at Login** | Toggle auto-start at login (✓ when on). |
@@ -99,6 +100,31 @@ Google authorization. Then:
 
 The menu-bar label gets a leading glyph by state: **🔄** exporting,
 **⏸** paused, **⚠️** error (otherwise plain).
+
+---
+
+## Multiple Google accounts
+
+DocToPDF can watch sources across several Google accounts at once (e.g. personal
++ school/work). The OAuth app identity (`client_secret.json`) is shared — the same
+one authorizes any number of accounts — so there's **no new Google Cloud setup and
+no new scope**; accounts are told apart via Drive's `about` endpoint, already
+covered by `drive.readonly`.
+
+- **Accounts ▸** lists authorized accounts (✓ = default for new targets; ⚠️ = a
+  token that needs re-authorizing — click it to re-auth just that one).
+- **Add account…** runs the normal browser authorization for another account.
+  Re-adding one you already have just refreshes its token (no duplicate).
+- **Remove account ▸** signs an account out; if it still had watched targets,
+  you're asked to reassign them to another account or remove them.
+- When you **Add Doc or Folder…** with more than one account authorized, you pick
+  which account can open it; each target is then fetched with that account's
+  credential. Web-page targets have no account.
+
+Tokens are stored one-per-account under `tokens/<email>.json` (chmod 600) with an
+`accounts.json` index; both are gitignored. **Existing single-account setups keep
+working with no re-auth** — on first launch the old `token.json` is migrated
+silently to your default account.
 
 ---
 
@@ -459,6 +485,7 @@ launchctl unload ~/Library/LaunchAgents/com.doctopdf.agent.plist
 doctopdf/
   app.py         # native AppKit menu bar: status item, menu, multi-target watch loop
   drive.py       # Google auth + Drive get/list/export helpers
+  accounts.py    # multi-account: tokens/ store + accounts.json index, per-account creds, migration
   pipeline.py    # export pipeline: type-aware formats, output modes, git history, hook
   web.py         # web-page monitoring: fetch (static/Playwright) + extract/denoise
   summarize.py   # local-model (Ollama) change summary + severity/category classify
