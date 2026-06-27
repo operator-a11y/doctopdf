@@ -289,6 +289,34 @@ class PerTargetCredentialTests(unittest.TestCase):
         self.assertIn(("A@x.com", "d1"), self.calls)
         self.assertIn(("B@x.com", "d2"), self.calls)
 
+    def test_folder_children_inherit_parent_account(self):
+        ctl = self._ctl()
+        folder_mime = "application/vnd.google-apps.folder"
+        doc_mime = "application/vnd.google-apps.document"
+
+        def meta(service, fid):
+            self.calls.append((service["acct"], fid))
+            mime = folder_mime if fid == "F" else doc_mime
+            return {"id": fid, "name": f"N {fid}", "modifiedTime": "T", "mimeType": mime}
+
+        drive.get_file_metadata = meta
+        list_calls = []
+
+        def listf(service, fid):
+            list_calls.append((service["acct"], fid))
+            return [{"id": "c1", "name": "C1", "modifiedTime": "T", "mimeType": doc_mime},
+                    {"id": "c2", "name": "C2", "modifiedTime": "T", "mimeType": doc_mime}]
+
+        orig_list = drive.list_folder
+        drive.list_folder = listf
+        self.addCleanup(lambda: setattr(drive, "list_folder", orig_list))
+
+        targets, errors = self.Controller._resolve_targets(ctl, [{"id": "F", "account": "B@x.com"}])
+        self.assertEqual(errors, [])
+        self.assertEqual({t["id"]: t["account"] for t in targets},
+                         {"c1": "B@x.com", "c2": "B@x.com"})
+        self.assertIn(("B@x.com", "F"), list_calls)  # folder listed with its account
+
     def test_one_bad_account_does_not_abort_the_others(self):
         ctl = self._ctl()
         good = accounts.credentials_for

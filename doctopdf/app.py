@@ -39,6 +39,7 @@ from AppKit import (
     NSControlStateValueOn,
     NSMenu,
     NSMenuItem,
+    NSPopUpButton,
     NSStatusBar,
     NSTextField,
     NSTimer,
@@ -1342,6 +1343,18 @@ class DocToPDFController(NSObject):
         if entry is None:
             self._alert("Invalid link", "Paste a Google file/folder URL or ID, or a web page URL.")
             return
+        # Bind a Google target to an account: pick when >1 is authorized, use the
+        # only one silently, or leave it for the default if none is set up yet.
+        # (Web targets have no account.)
+        if entry.get("kind") != "web":
+            accts = accounts.list_accounts()
+            if len(accts) > 1:
+                chosen = self._pick_account(accts, accounts.default_key())
+                if chosen is None:
+                    return  # cancelled the account picker
+                entry["account"] = chosen
+            elif len(accts) == 1:
+                entry["account"] = accts[0].get("email")
         key = entry.get("url") or entry.get("id")
         with self._lock:
             if any((e.get("url") or e.get("id")) == key for e in self._watch):
@@ -1353,6 +1366,30 @@ class DocToPDFController(NSObject):
             self._interval = self._base_interval
         config.save_config(self._config)
         self._wake.set()
+
+    @objc.python_method
+    def _pick_account(self, accts, default_email):
+        """Modal popup to choose which account a new Google target belongs to.
+
+        Returns the chosen account email, or ``None`` if cancelled.
+        """
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Which account?")
+        alert.setInformativeText_("Choose the Google account that can open this item.")
+        alert.addButtonWithTitle_("Add")
+        alert.addButtonWithTitle_("Cancel")
+        popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(0, 0, 300, 26), False)
+        emails = [a.get("email") for a in accts]
+        for e in emails:
+            popup.addItemWithTitle_(e)
+        if default_email in emails:
+            popup.selectItemWithTitle_(default_email)
+        alert.setAccessoryView_(popup)
+        if alert.runModal() != NSAlertFirstButtonReturn:
+            return None
+        return popup.titleOfSelectedItem()
 
     @objc.python_method
     def _target_entry_from(self, text):
