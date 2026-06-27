@@ -272,9 +272,10 @@ export default function Home() {
               <div className="flex flex-col rounded-2xl border border-white/10 bg-neutral-900/40 p-8">
                 <h3 className="text-lg font-semibold text-white">Download the app</h3>
                 <p className="mt-2 flex-1 text-sm leading-relaxed text-neutral-400">
-                  Grab the latest macOS build (Apple silicon). It&apos;s an unsigned preview, so
-                  on first open <span className="text-neutral-200">right-click the app → Open</span>.
-                  You also add your own Google OAuth client once — see the setup guide.
+                  Grab the latest macOS build — <span className="text-neutral-200">universal2,
+                  native on Apple silicon &amp; Intel</span>. It&apos;s an unsigned preview, so on
+                  first open right-click the app → Open. You also add your own Google OAuth
+                  client once — see the setup guide.
                 </p>
                 <a
                   href={site.download}
@@ -283,7 +284,7 @@ export default function Home() {
                   <Download className="h-4 w-4" /> Download for macOS
                 </a>
                 <p className="mt-3 text-xs text-neutral-400">
-                  v0.1.0 · Apple silicon ·{" "}
+                  v0.1.1 · universal2 (macOS 11+) ·{" "}
                   <a href={site.releases} className="underline underline-offset-2 hover:text-white">all releases</a>
                 </p>
               </div>
