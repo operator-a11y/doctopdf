@@ -1,6 +1,6 @@
 # DocToPDF
 
-![DocToPDF menu bar watching docs, exporting on change, and alerting on a material pricing change](docs/demo.gif)
+![DocToPDF menu bar: watching Docs and web pages across multiple Google accounts, exporting on change, and alerting on material changes](docs/demo.gif)
 
 A macOS **menu-bar app** that watches Google **Docs, Sheets, Slides** — whole
 **Drive folders** — and **web pages** (competitor pricing, ToS, changelogs), and
