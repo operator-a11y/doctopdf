@@ -8,9 +8,11 @@ export const site = {
   // Public site URL — used for metadataBase (OG image / canonical).
   url: "https://doctopdf-pi.vercel.app",
   repo: "https://github.com/operator-a11y/doctopdf",
-  // The "Download for macOS" button points here. Publish a signed .dmg to GitHub
-  // Releases and this becomes a true one-click download.
-  download: "https://github.com/operator-a11y/doctopdf/releases/latest",
+  // Direct download of the latest macOS build (the asset name is stable across
+  // releases, so this always points at the newest one).
+  download: "https://github.com/operator-a11y/doctopdf/releases/latest/download/DocToPDF-macos.zip",
+  // The releases listing page (all versions + notes).
+  releases: "https://github.com/operator-a11y/doctopdf/releases",
   readme: "https://github.com/operator-a11y/doctopdf#readme",
   setup: "https://github.com/operator-a11y/doctopdf#one-time-google-cloud-setup-you-must-do-this-once",
 } as const;

@@ -1,0 +1,56 @@
+name: Build macOS app
+
+# Push a version tag (e.g. `git tag v0.2.0 && git push origin v0.2.0`) and this
+# builds the .app on an Apple-silicon runner and attaches DocToPDF-macos.zip to
+# the GitHub Release for that tag. The asset name is stable, so the website's
+# /releases/latest/download/DocToPDF-macos.zip button always serves the newest.
+#
+# This produces an UNSIGNED build. To ship a notarized, Gatekeeper-clean app,
+# add signing/notarization secrets + steps — see packaging/PUBLISHING.md.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14 # Apple silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build deps
+        # Lean set: only what the bundle actually includes. The heavy optional
+        # deps (chromadb / playwright / trafilatura) are excluded in setup.py and
+        # the app degrades gracefully without them.
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            pyobjc-framework-Cocoa \
+            google-api-python-client \
+            google-auth-oauthlib \
+            google-auth \
+            requests \
+            "markdown>=3.4" \
+            "nh3>=0.2" \
+            py2app
+
+      - name: Build .app
+        run: python setup.py py2app
+
+      - name: Zip bundle
+        run: ditto -c -k --keepParent dist/DocToPDF.app dist/DocToPDF-macos.zip
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DocToPDF-macos.zip
+          fail_on_unmatched_files: true

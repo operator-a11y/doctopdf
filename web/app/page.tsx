@@ -272,17 +272,20 @@ export default function Home() {
               <div className="flex flex-col rounded-2xl border border-white/10 bg-neutral-900/40 p-8">
                 <h3 className="text-lg font-semibold text-white">Download the app</h3>
                 <p className="mt-2 flex-1 text-sm leading-relaxed text-neutral-400">
-                  Packaged macOS builds are published to GitHub Releases. A signed, notarized
-                  build is on the way — until it lands, the one-step source install gets you
-                  running right now.
+                  Grab the latest macOS build (Apple silicon). It&apos;s an unsigned preview, so
+                  on first open <span className="text-neutral-200">right-click the app → Open</span>.
+                  You also add your own Google OAuth client once — see the setup guide.
                 </p>
                 <a
                   href={site.download}
                   className="mt-6 inline-flex items-center justify-center gap-2 rounded-full bg-indigo-500 px-6 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-400"
                 >
-                  <Download className="h-4 w-4" /> Get the latest release
+                  <Download className="h-4 w-4" /> Download for macOS
                 </a>
-                <p className="mt-3 text-xs text-neutral-400">Published to GitHub Releases</p>
+                <p className="mt-3 text-xs text-neutral-400">
+                  v0.1.0 · Apple silicon ·{" "}
+                  <a href={site.releases} className="underline underline-offset-2 hover:text-white">all releases</a>
+                </p>
               </div>
 
               {/* From source */}
@@ -320,7 +323,7 @@ python -m doctopdf`}
           <div className="flex items-center gap-6 text-sm text-neutral-400">
             <a href={site.repo} className="transition-colors hover:text-white">GitHub</a>
             <a href={site.readme} className="transition-colors hover:text-white">Docs</a>
-            <a href={site.download} className="transition-colors hover:text-white">Releases</a>
+            <a href={site.releases} className="transition-colors hover:text-white">Releases</a>
           </div>
         </div>
         <p className="mt-8 text-center text-xs text-neutral-400">
