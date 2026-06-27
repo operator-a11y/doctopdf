@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 from typing import Callable, Optional
 
 from google.auth.exceptions import RefreshError
@@ -75,15 +76,18 @@ def parse_doc_id(text: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def _save_token(creds: Credentials) -> None:
-    """Atomically write credentials to ``token.json`` with 0600 perms.
+def write_token(path: Path, creds: Credentials) -> None:
+    """Atomically write credentials to ``path`` with 0600 perms.
 
     Writes to a fresh, exclusively-created temp file (mode 0600 from birth) and
     ``os.replace`` it into place. The destination inherits the temp file's tight
     perms, so there is never a world-readable window — even when overwriting a
-    pre-existing token that had looser perms.
+    pre-existing token that had looser perms. ``path`` is parameterized so the
+    single-token (legacy) and per-account (``tokens/<email>.json``) callers share
+    one hardened writer.
     """
-    tmp = config.TOKEN_PATH.with_name(config.TOKEN_PATH.name + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
     # O_EXCL: never reuse a leftover temp with unknown perms.
     try:
         os.unlink(tmp)
@@ -95,13 +99,18 @@ def _save_token(creds: Credentials) -> None:
             fh.write(creds.to_json())
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, config.TOKEN_PATH)
+        os.replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def _save_token(creds: Credentials) -> None:
+    """Persist credentials to the legacy single-token path (back-compat)."""
+    write_token(config.TOKEN_PATH, creds)
 
 
 def get_credentials() -> Credentials:
@@ -134,37 +143,51 @@ def get_credentials() -> Credentials:
             creds = None
 
     # No usable token — run the interactive installed-app flow.
-    if not config.CLIENT_SECRET_PATH.exists():
-        raise DriveError(
-            "Missing client_secret.json — see the README to create OAuth credentials."
-        )
-
-    try:
-        flow = InstalledAppFlow.from_client_secrets_file(
-            str(config.CLIENT_SECRET_PATH), config.SCOPES
-        )
-        creds = flow.run_local_server(port=0)
-    except Exception as exc:  # noqa: BLE001 — surface any flow failure as a clean message
-        raise AuthFlowError(f"Authorization failed: {exc}") from exc
-
+    creds = run_install_flow()
     _save_token(creds)
     return creds
 
 
-def maybe_persist_refreshed_token(creds: Credentials) -> None:
+def run_install_flow() -> Credentials:
+    """Run the interactive loopback OAuth flow and return fresh credentials.
+
+    Opens a browser to authorize read-only Drive access using the shared
+    ``client_secret.json`` app identity — the same identity authorizes any number
+    of accounts, so this is reused verbatim when adding each account. Raises
+    :class:`DriveError` if the client secret is missing and :class:`AuthFlowError`
+    if the flow itself fails (e.g. the user closes the window). The caller is
+    responsible for persisting the returned token.
+    """
+    if not config.CLIENT_SECRET_PATH.exists():
+        raise DriveError(
+            "Missing client_secret.json — see the README to create OAuth credentials."
+        )
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(config.CLIENT_SECRET_PATH), config.SCOPES
+        )
+        return flow.run_local_server(port=0)
+    except Exception as exc:  # noqa: BLE001 — surface any flow failure as a clean message
+        raise AuthFlowError(f"Authorization failed: {exc}") from exc
+
+
+def maybe_persist_refreshed_token(creds: Credentials, path: Optional[Path] = None) -> None:
     """Persist the token if the API client refreshed it under us.
 
     The googleapiclient transport auto-refreshes an expired access token in
     memory but does not write it back to disk; call this after a successful
-    request so a freshly minted access token survives a restart.
+    request so a freshly minted access token survives a restart. ``path`` selects
+    which token file to compare/update (per-account callers pass that account's
+    ``tokens/<email>.json``); it defaults to the legacy single-token path.
     """
+    path = path or config.TOKEN_PATH
     try:
         on_disk = ""
-        if config.TOKEN_PATH.exists():
-            with open(config.TOKEN_PATH, "r", encoding="utf-8") as fh:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as fh:
                 on_disk = fh.read()
         if creds.to_json() != on_disk:
-            _save_token(creds)
+            write_token(path, creds)
     except OSError:
         pass
 
@@ -177,6 +200,24 @@ def maybe_persist_refreshed_token(creds: Credentials) -> None:
 def build_service(creds: Credentials):
     """Build a Drive v3 service client."""
     return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def get_about_user(service) -> dict:
+    """Identify the account behind ``service`` as ``{email, permission_id}``.
+
+    Uses the Drive ``about.get`` endpoint, which is covered by the existing
+    ``drive.readonly`` scope — so multiple accounts are distinguished without any
+    new OAuth scope or Google Cloud setup. ``emailAddress`` is the human label /
+    key; ``permissionId`` is a stable id used to dedupe the same account added
+    twice. Refresh/401 failures surface as :class:`ReauthRequired`; transient
+    network failures as a retryable :class:`DriveError`.
+    """
+    about = _call(
+        lambda: service.about().get(fields="user(emailAddress,permissionId)").execute(),
+        "account",
+    )
+    user = about.get("user") or {}
+    return {"email": user.get("emailAddress"), "permission_id": user.get("permissionId")}
 
 
 def _call(fn: Callable, file_id: str):

@@ -46,8 +46,9 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSObject
 
-from . import (alerts, audit, config, digest, drive, launchagent, pipeline, prefs,
-               publish, rag, summarize, web)
+from . import (accounts, alerts, audit, config, digest, drive, launchagent,
+               pipeline, prefs, publish, rag, summarize, web)
+from .accounts import AccountAuthError
 from .drive import AuthFlowError, DriveError, ReauthRequired
 from .pipeline import sanitize_filename  # re-exported for convenience
 
@@ -173,8 +174,13 @@ class DocToPDFController(NSObject):
         self._recent_dirty = True
 
         # --- worker plumbing ----------------------------------------------
-        self.creds = None
-        self.service = None
+        # Per-account credential/service caches, keyed by account email. Built
+        # lazily by _service_for and dropped per-account on a stale token, so one
+        # account's auth problem never blanks out the others. (Worker-thread
+        # owned; _account_errors is read by the UI tick under _lock.)
+        self._svc: dict = {}                # account email -> Drive service
+        self._svc_creds: dict = {}          # account email -> Credentials
+        self._account_errors: dict = {}     # account email -> last auth error msg
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._worker = threading.Thread(target=self._run_worker, name="watch", daemon=True)
@@ -328,11 +334,12 @@ class DocToPDFController(NSObject):
                 interval = self._interval
                 force_pending = self._force      # peeked, NOT consumed yet
 
-            # Authorize as early as possible (independent of whether a doc is set),
-            # so the app prompts on first launch and sits ready in the menu bar.
-            # Skip auth only when idle-paused with nothing explicitly queued, so we
-            # don't pop a browser while the user has it paused.
-            if self.service is None and not (paused and not force_pending):
+            # Ensure at least one Google account is authorized before polling, so
+            # the app prompts on first launch and sits ready in the menu bar. On
+            # first run a legacy single-account token.json migrates silently;
+            # otherwise the interactive flow adds the first account. Skip while
+            # idle-paused with nothing queued so we don't pop a browser.
+            if not accounts.list_accounts() and not (paused and not force_pending):
                 if blocked:
                     if paused:
                         self._update_state(kind="paused")
@@ -342,7 +349,7 @@ class DocToPDFController(NSObject):
                     self._set_error("Missing client_secret.json — see README.")
                     self._sleep_or_wake(max(interval, 10))
                     continue
-                if not self._authorize():        # sets state/flags on failure
+                if not self._bootstrap_account():   # migrate or interactive add
                     self._sleep_or_wake(interval)
                     continue
                 with self._lock:
@@ -375,10 +382,11 @@ class DocToPDFController(NSObject):
                     self._auth_blocked = True
                 self._set_error(str(exc))
             except ReauthRequired as exc:
-                # Credentials went stale mid-session. Drop the service so the next
-                # cycle re-runs auth (silent refresh, or interactive on failure).
-                self.service = None
-                self.creds = None
+                # Safety net: a stale credential slipped past the per-account
+                # handling in resolve/poll. Drop all cached services so the next
+                # cycle rebuilds/refreshes them (per-account, lazily).
+                self._svc.clear()
+                self._svc_creds.clear()
                 self._set_error(str(exc))
             except DriveError as exc:
                 self._set_error(str(exc))
@@ -394,12 +402,24 @@ class DocToPDFController(NSObject):
             self._sleep_or_wake(interval)
 
     @objc.python_method
-    def _authorize(self) -> bool:
-        """Acquire credentials/service. Returns True on success."""
+    def _bootstrap_account(self) -> bool:
+        """Ensure ≥1 account exists: migrate a legacy token, else interactive add.
+
+        Returns True once an account is available. Migration is idempotent and
+        only deletes the legacy token after the migrated copy is confirmed
+        written, so a failed/offline migration safely falls through (and retries
+        next cycle) without losing the working token.
+        """
         self._update_state(kind="authorizing")
         try:
-            self.creds = drive.get_credentials()
-            self.service = drive.build_service(self.creds)
+            if accounts.migrate_legacy_token():
+                return True
+        except Exception:  # noqa: BLE001 — migration must never crash the worker
+            pass
+        if accounts.list_accounts():
+            return True
+        try:
+            accounts.authorize_new_account()
             return True
         except AuthFlowError as exc:
             with self._lock:
@@ -414,24 +434,62 @@ class DocToPDFController(NSObject):
             return False
 
     @objc.python_method
+    def _service_for(self, account_key):
+        """Return a cached Drive service for an account (``None`` → default).
+
+        Builds and caches the service + credentials on first use. Raises
+        :class:`AccountAuthError` if that account's token is missing or
+        unrecoverable — callers handle it per-target so one bad account never
+        blocks the others.
+        """
+        key = account_key or accounts.default_key()
+        if key is None:
+            raise AccountAuthError("No Google account authorized — add one under Accounts.")
+        svc = self._svc.get(key)
+        if svc is not None:
+            return svc
+        creds = accounts.credentials_for(key)
+        svc = drive.build_service(creds)
+        self._svc[key] = svc
+        self._svc_creds[key] = creds
+        with self._lock:
+            self._account_errors.pop(key, None)
+        return svc
+
+    @objc.python_method
+    def _drop_account(self, account_key, msg=None) -> None:
+        """Forget an account's cached service/creds (e.g. after a stale-token
+        error) so the next cycle rebuilds + refreshes it; record the error for
+        the menu so the user can re-authorize just that account."""
+        key = account_key or accounts.default_key()
+        if key is None:
+            return
+        self._svc.pop(key, None)
+        self._svc_creds.pop(key, None)
+        if msg:
+            with self._lock:
+                self._account_errors[key] = msg
+
+    @objc.python_method
     def _resolve_targets(self, watch: list):
         """Expand the watch list into concrete file targets (folders → their
         direct children, non-recursive). Returns ``(targets, errors)``.
 
-        Each target is ``{id, name, modified, gtype, overrides}``. A single bad
-        entry (deleted/unshared/network) is caught and reported, never aborting
-        the others; ReauthRequired bubbles up so the worker can re-auth. Targets
-        are de-duplicated by id, and colliding display names are disambiguated.
+        Each target is ``{id, name, modified, gtype, overrides, account}``. Each
+        Google entry is fetched with its own account's credential; a single bad
+        entry (deleted/unshared/network, or a stale account token) is caught and
+        reported per-target, never aborting the others. Targets are de-duplicated
+        by id, and colliding display names are disambiguated.
         """
         targets, entry_names, errors, seen = [], {}, [], set()
 
-        def add(fid, name, modified, gtype, overrides, who=None, rag_flag=None):
+        def add(fid, name, modified, gtype, overrides, who=None, rag_flag=None, account=None):
             if fid in seen:
                 return
             seen.add(fid)
             targets.append({"kind": "drive", "id": fid, "name": name or fid,
                             "modified": modified, "gtype": gtype, "overrides": overrides,
-                            "who": who, "rag": rag_flag})
+                            "who": who, "rag": rag_flag, "account": account})
 
         def editor(m):
             return (m.get("lastModifyingUser") or {}).get("displayName")
@@ -462,28 +520,45 @@ class DocToPDFController(NSObject):
             if not fid:
                 continue
             overrides = {k: entry[k] for k in ("output_dir", "formats") if k in entry}
+            # Fetch this entry with its own account's credential (None → default).
+            acct_key = entry.get("account")
             try:
-                meta = drive.get_file_metadata(self.service, fid)
-                drive.maybe_persist_refreshed_token(self.creds)
+                service = self._service_for(acct_key)
+            except AccountAuthError as exc:
+                entry_names[fid] = f"⚠️ {fid[:8]}…: {exc}"
+                errors.append(f"{fid[:8]}…: {exc}")
+                continue
+            key = acct_key or accounts.default_key()
+            try:
+                meta = drive.get_file_metadata(service, fid)
+                creds = self._svc_creds.get(key)
+                if creds is not None:
+                    accounts.persist_if_refreshed(key, creds)
                 gtype = pipeline.google_type(meta.get("mimeType"))
                 label = meta.get("name") or fid
                 if gtype == "folder":
                     n = 0
-                    for child in drive.list_folder(self.service, fid):
+                    # Folder children inherit the parent entry's account.
+                    for child in drive.list_folder(service, fid):
                         cgt = pipeline.google_type(child.get("mimeType"))
                         if cgt in pipeline.FORMATS_BY_TYPE:
                             add(child["id"], child.get("name"), child.get("modifiedTime"),
-                                cgt, overrides, editor(child), entry.get("rag"))
+                                cgt, overrides, editor(child), entry.get("rag"), acct_key)
                             n += 1
                     entry_names[fid] = f"📁 {label} ({n})"
                 elif gtype in pipeline.FORMATS_BY_TYPE:
                     add(fid, label, meta.get("modifiedTime"), gtype, overrides,
-                        editor(meta), entry.get("rag"))
+                        editor(meta), entry.get("rag"), acct_key)
                     entry_names[fid] = label
                 else:
                     entry_names[fid] = f"{label} (unsupported)"
-            except ReauthRequired:
-                raise
+            except ReauthRequired as exc:
+                # This account's session went stale mid-resolve. Drop its cached
+                # service so the next cycle refreshes it, and report per-target —
+                # never bubble up and disturb the other accounts.
+                self._drop_account(key, str(exc))
+                entry_names[fid] = f"⚠️ {fid[:8]}…: {exc}"
+                errors.append(f"{fid[:8]}…: {exc}")
             except DriveError as exc:
                 entry_names[fid] = f"⚠️ {fid[:8]}…: {exc}"
                 errors.append(f"{fid[:8]}…: {exc}")
@@ -578,7 +653,15 @@ class DocToPDFController(NSObject):
         self._update_state(kind="exporting")
         cfg = dict(self._config)
         cfg.update(t.get("overrides") or {})  # per-target output_dir/formats override
-        result = pipeline.run_export(cfg, self.service, fid, name, gtype)
+        # Export with this target's own account credential (None → default).
+        try:
+            service = self._service_for(t.get("account"))
+            result = pipeline.run_export(cfg, service, fid, name, gtype)
+        except AccountAuthError as exc:
+            return str(exc)
+        except ReauthRequired as exc:
+            self._drop_account(t.get("account"), str(exc))
+            return str(exc)
 
         primary = result.get("primary")
         now = time.strftime("%H:%M:%S")

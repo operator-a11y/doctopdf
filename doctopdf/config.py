@@ -1,7 +1,9 @@
 """Configuration, paths, and persistence for DocToPDF.
 
-- OAuth secrets (``client_secret.json``) and the cached ``token.json`` live in the
-  project root, next to this package. Both are gitignored.
+- The OAuth app secret (``client_secret.json``) lives in the project root. Cached
+  credentials live there too: a legacy single ``token.json`` (auto-migrated) and,
+  for multi-account, a ``tokens/`` dir + an ``accounts.json`` index (see
+  :mod:`accounts`). All are gitignored.
 - User config (watched doc id, output dir, poll interval, …) is persisted to
   ``~/Library/Application Support/DocToPDF/config.json``.
 """

@@ -1,6 +1,9 @@
 # Google OAuth secrets — never commit these
 client_secret.json
 token.json
+# Per-account tokens + the accounts index (multi-account support)
+tokens/
+accounts.json
 
 # Python
 __pycache__/
