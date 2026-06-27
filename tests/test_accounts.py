@@ -226,12 +226,15 @@ class PerTargetCredentialTests(unittest.TestCase):
             "credentials_for": accounts.credentials_for,
             "default_key": accounts.default_key,
             "persist_if_refreshed": accounts.persist_if_refreshed,
+            "list_accounts": accounts.list_accounts,
         }
         # Each account's "service" is a marker dict tagged with the account key.
         drive.build_service = lambda creds: {"acct": creds._tag}
         accounts.credentials_for = lambda key: FakeCreds(tag=key)
         accounts.default_key = lambda: "A@x.com"
         accounts.persist_if_refreshed = lambda email, creds: None
+        accounts.list_accounts = lambda: [{"email": "A@x.com", "is_default": True},
+                                          {"email": "B@x.com", "is_default": False}]
         self.calls = []
 
         def meta(service, fid):
@@ -247,6 +250,7 @@ class PerTargetCredentialTests(unittest.TestCase):
         accounts.credentials_for = self._orig["credentials_for"]
         accounts.default_key = self._orig["default_key"]
         accounts.persist_if_refreshed = self._orig["persist_if_refreshed"]
+        accounts.list_accounts = self._orig["list_accounts"]
 
     def _ctl(self):
         ctl = type("Ctl", (), {})()
@@ -334,6 +338,59 @@ class PerTargetCredentialTests(unittest.TestCase):
         self.assertIn("d1", ids, "the healthy account still resolves")
         self.assertNotIn("d2", ids)
         self.assertTrue(any("d2" in e for e in errors))
+
+    def test_orphaned_target_unknown_account_is_flagged_not_fetched(self):
+        ctl = self._ctl()
+        # Z@x.com is not in the known set → orphaned (its account was removed).
+        watch = [{"id": "d1", "account": "A@x.com"},
+                 {"id": "d2", "account": "Z@x.com"}]
+        targets, errors = self.Controller._resolve_targets(ctl, watch)
+        ids = {t["id"] for t in targets}
+        self.assertIn("d1", ids)
+        self.assertNotIn("d2", ids, "an orphaned target is not fetched under another identity")
+        self.assertTrue(any("no longer authorized" in e for e in errors))
+        # The orphan was never fetched (no Drive call for d2).
+        self.assertNotIn("d2", [fid for _, fid in self.calls])
+
+
+class OrphanHandlingTests(unittest.TestCase):
+    """Reassign / remove logic for targets bound to a removed account."""
+
+    def setUp(self):
+        from doctopdf.app import DocToPDFController
+        self.C = DocToPDFController
+        from doctopdf import config as _config
+        self._config = _config
+        self._save = _config.save_config
+        self.saved = []
+        _config.save_config = lambda c: self.saved.append({k: list(v) if isinstance(v, list) else v
+                                                           for k, v in c.items()})
+
+    def tearDown(self):
+        self._config.save_config = self._save
+
+    def _ctl(self, watch):
+        ctl = type("Ctl", (), {})()
+        ctl._lock = threading.RLock()
+        ctl._watch = list(watch)
+        ctl._config = {"watch": list(watch)}
+        ctl._reassign_orphans = lambda email, dest: self.C._reassign_orphans(ctl, email, dest)
+        ctl._remove_orphan_entries = lambda email: self.C._remove_orphan_entries(ctl, email)
+        return ctl
+
+    def test_remove_orphans_drops_only_that_accounts_targets(self):
+        ctl = self._ctl([{"id": "d1", "account": "A"},
+                         {"id": "d2", "account": "B"},
+                         {"kind": "web", "id": "u"}])
+        ctl._remove_orphan_entries("A")
+        self.assertEqual([e.get("id") for e in ctl._watch], ["d2", "u"])
+        self.assertTrue(self.saved, "the watch list is persisted")
+
+    def test_reassign_orphans_moves_only_that_accounts_targets(self):
+        ctl = self._ctl([{"id": "d1", "account": "A"},
+                         {"id": "d2", "account": "B"}])
+        ctl._reassign_orphans("A", "B")
+        self.assertEqual([e.get("account") for e in ctl._watch], ["B", "B"])
 
 
 if __name__ == "__main__":

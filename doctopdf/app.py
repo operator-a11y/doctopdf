@@ -33,6 +33,8 @@ import objc
 from AppKit import (
     NSAlert,
     NSAlertFirstButtonReturn,
+    NSAlertSecondButtonReturn,
+    NSAlertThirdButtonReturn,
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSControlStateValueOff,
@@ -500,6 +502,7 @@ class DocToPDFController(NSObject):
         by id, and colliding display names are disambiguated.
         """
         targets, entry_names, errors, seen = [], {}, [], set()
+        known_accounts = {a.get("email") for a in accounts.list_accounts()}
 
         def add(fid, name, modified, gtype, overrides, who=None, rag_flag=None, account=None):
             if fid in seen:
@@ -540,6 +543,14 @@ class DocToPDFController(NSObject):
             overrides = {k: entry[k] for k in ("output_dir", "formats") if k in entry}
             # Fetch this entry with its own account's credential (None → default).
             acct_key = entry.get("account")
+            # Orphaned target: its bound account was removed. Don't fetch it under
+            # a different identity — flag it clearly so the user can re-add or
+            # reassign it (Accounts ▸), and move on without aborting the others.
+            if acct_key and acct_key not in known_accounts:
+                msg = f"account {acct_key} no longer authorized — re-add or reassign"
+                entry_names[fid] = f"⚠️ {fid[:8]}…: {msg}"
+                errors.append(f"{fid[:8]}…: {msg}")
+                continue
             try:
                 service = self._service_for(acct_key)
             except AccountAuthError as exc:
@@ -1434,9 +1445,15 @@ class DocToPDFController(NSObject):
         self._wake.set()
 
     def onAccountClicked_(self, sender) -> None:
-        """Click an account row → make it the default for new targets."""
+        """Click an account row → set it as default, or re-authorize it if its
+        token has gone stale (the row shows ⚠️)."""
         email = sender.representedObject()
         if not email:
+            return
+        with self._lock:
+            errored = email in self._account_errors
+        if errored:
+            self._authorize_account_async("Account re-authorized")
             return
         accounts.set_default(email)
         with self._lock:
@@ -1444,41 +1461,49 @@ class DocToPDFController(NSObject):
         self._wake.set()
 
     def onAddAccount_(self, _sender) -> None:
-        """Authorize an additional Google account.
+        """Authorize an additional Google account (interactive)."""
+        self._authorize_account_async("Account added")
 
-        The interactive OAuth flow runs OFF the main thread so the menu never
-        freezes during the browser round-trip; the result is reported via a
-        notification and the worker is woken to pick the new account up. The
-        flow is serialized with the worker's bootstrap so two browser windows
-        can't open at once, and re-adding an existing account just refreshes its
-        token (dedupe by permissionId) rather than duplicating it.
+    @objc.python_method
+    def _authorize_account_async(self, ok_title) -> None:
+        """Run the interactive OAuth flow OFF the main thread so the menu never
+        freezes during the browser round-trip; report the result via a
+        notification and wake the worker. Serialized with the worker bootstrap
+        (one browser window at a time). Dedupe-by-permissionId means re-adding /
+        re-authorizing an existing account refreshes its token in place — which
+        is also how a stale account recovers — rather than duplicating it.
+        Managed/Workspace or admin-blocked sign-ins surface as a clear
+        notification instead of crashing.
         """
         def go():
             if not self._auth_lock.acquire(blocking=False):
-                self._notify("Add account", "Authorization already in progress.")
+                self._notify(ok_title, "Authorization already in progress.")
                 return
             try:
                 acct = accounts.authorize_new_account()
             except AuthFlowError as exc:
-                self._notify("Account not added", str(exc))
+                self._notify("Authorization failed", str(exc))
                 return
             except DriveError as exc:
-                self._notify("Account not added", str(exc))
+                self._notify("Authorization failed", str(exc))
                 return
             except Exception as exc:  # noqa: BLE001
-                self._notify("Account not added", f"Error: {exc}")
+                self._notify("Authorization failed", f"Error: {exc}")
                 return
             finally:
                 self._auth_lock.release()
+            email = acct.get("email")
             with self._lock:
                 self._auth_blocked = False
-                self._account_errors.pop(acct.get("email"), None)
+                self._account_errors.pop(email, None)   # clear any stale-token flag
+                self._svc.pop(email, None)              # reload with the fresh token
+                self._svc_creds.pop(email, None)
                 self._accounts_sig = None
                 self._force = True
-            self._notify("Account added", f"Authorized {acct.get('email')}.")
+            self._notify(ok_title, f"Authorized {email}.")
             self._wake.set()
 
-        threading.Thread(target=go, name="doctopdf-addaccount", daemon=True).start()
+        threading.Thread(target=go, name="doctopdf-authaccount", daemon=True).start()
 
     def onRemoveAccount_(self, sender) -> None:
         email = sender.representedObject()
@@ -1494,13 +1519,72 @@ class DocToPDFController(NSObject):
         alert.addButtonWithTitle_("Cancel")
         if alert.runModal() != NSAlertFirstButtonReturn:
             return
-        accounts.remove_account(email)
+        remaining = accounts.remove_account(email)
         with self._lock:
             self._svc.pop(email, None)
             self._svc_creds.pop(email, None)
             self._account_errors.pop(email, None)
             self._accounts_sig = None
+        # Deal with any watch targets that were bound to the removed account.
+        self._reassign_or_remove_orphans(email, remaining)
         self._wake.set()
+
+    @objc.python_method
+    def _reassign_or_remove_orphans(self, email, remaining) -> None:
+        """After removing ``email``, deal with watch targets still bound to it:
+        reassign to another account, remove them, or leave them (they'll show an
+        error until re-added/reassigned). Never silently drops a target."""
+        with self._lock:
+            orphans = [e for e in self._watch if e.get("account") == email]
+        if not orphans:
+            return
+        n = len(orphans)
+        plural = "target" if n == 1 else "targets"
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        alert = NSAlert.alloc().init()
+        if remaining:
+            alert.setMessageText_(f"Reassign {n} {plural}?")
+            alert.setInformativeText_(
+                f"“{email}” had {n} watched {plural}. Reassign to another account, "
+                "remove them, or keep them (they'll show an error until reassigned).")
+            alert.addButtonWithTitle_("Reassign…")
+            alert.addButtonWithTitle_("Remove targets")
+            alert.addButtonWithTitle_("Keep")
+            choice = alert.runModal()
+            if choice == NSAlertFirstButtonReturn:
+                dest = self._pick_account(remaining, remaining[0].get("email"))
+                if dest is not None:
+                    self._reassign_orphans(email, dest)
+            elif choice == NSAlertSecondButtonReturn:
+                self._remove_orphan_entries(email)
+            # NSAlertThirdButtonReturn ("Keep") → leave them; they error on resolve.
+        else:
+            alert.setMessageText_(f"{n} {plural} orphaned")
+            alert.setInformativeText_(
+                f"Removing “{email}” leaves {n} {plural} with no account. Remove "
+                "them, or keep them (they'll show an error until you add an account).")
+            alert.addButtonWithTitle_("Remove targets")
+            alert.addButtonWithTitle_("Keep")
+            if alert.runModal() == NSAlertFirstButtonReturn:
+                self._remove_orphan_entries(email)
+
+    @objc.python_method
+    def _reassign_orphans(self, email, dest) -> None:
+        """Rebind every watch target on ``email`` to account ``dest``."""
+        with self._lock:
+            for e in self._watch:
+                if e.get("account") == email:
+                    e["account"] = dest
+            self._config["watch"] = list(self._watch)
+        config.save_config(self._config)
+
+    @objc.python_method
+    def _remove_orphan_entries(self, email) -> None:
+        """Drop every watch target bound to ``email`` from the watch list."""
+        with self._lock:
+            self._watch = [e for e in self._watch if e.get("account") != email]
+            self._config["watch"] = list(self._watch)
+        config.save_config(self._config)
 
     def onExportNow_(self, _sender) -> None:
         with self._lock:
