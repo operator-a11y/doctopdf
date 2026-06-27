@@ -12,6 +12,10 @@ __pycache__/
 venv/
 *.egg-info/
 
+# py2app build output
+build/
+dist/
+
 # macOS
 .DS_Store
 
