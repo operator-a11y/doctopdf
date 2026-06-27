@@ -5,9 +5,8 @@ export const site = {
   tagline: "Watch your Google Docs. Get the PDF, the diff, and the alert — automatically.",
   description:
     "A macOS menu-bar app that watches Google Docs, Sheets, Slides, Drive folders, and web pages — re-exports them on every change and tells you what changed. Classified, alerted, versioned, and queryable. AI runs locally by default.",
-  // Public site URL — used for metadataBase (OG image / canonical). Update this
-  // to your real Vercel domain after deploying.
-  url: "https://doctopdf.vercel.app",
+  // Public site URL — used for metadataBase (OG image / canonical).
+  url: "https://doctopdf-pi.vercel.app",
   repo: "https://github.com/operator-a11y/doctopdf",
   // The "Download for macOS" button points here. Publish a signed .dmg to GitHub
   // Releases and this becomes a true one-click download.
