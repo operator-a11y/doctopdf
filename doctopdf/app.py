@@ -34,7 +34,6 @@ from AppKit import (
     NSAlert,
     NSAlertFirstButtonReturn,
     NSAlertSecondButtonReturn,
-    NSAlertThirdButtonReturn,
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSControlStateValueOff,
@@ -74,6 +73,12 @@ WEB_BACKOFF_CAP = 3600       # max backoff for a bot-blocked site (1h)
 
 RAG_RETRY_BASE = 30          # seconds before the first embed retry
 RAG_RETRY_CAP = 600          # max backoff while the embedder stays down
+
+# How many worker cycles to keep retrying a deferred legacy-token migration
+# (e.g. transient identify failure) before falling back to interactive auth —
+# so a working token.json migrates silently without forcing re-auth, yet a
+# corrupt/revoked one doesn't stall startup forever.
+MIGRATE_DEFER_MAX = 3
 
 PUB_RETRY_BASE = 30          # seconds before the first publish (push) retry
 PUB_RETRY_CAP = 900          # max backoff while a push keeps failing
@@ -187,6 +192,7 @@ class DocToPDFController(NSObject):
         # Serializes the interactive OAuth flow so the worker's bootstrap and a
         # menu "Add account…" can't pop two browser windows at once.
         self._auth_lock = threading.Lock()
+        self._migrate_attempts = 0          # bounded retries before bootstrap re-auths
         self._accounts_sig = None           # last-rendered Accounts submenu signature
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -425,19 +431,36 @@ class DocToPDFController(NSObject):
 
         Returns True once an account is available. Migration is idempotent and
         only deletes the legacy token after the migrated copy is confirmed
-        written, so a failed/offline migration safely falls through (and retries
-        next cycle) without losing the working token.
+        written. A deferred migration (e.g. transient identify failure) is retried
+        for a few cycles before falling back to interactive auth — so a valid
+        token.json migrates silently with no re-auth, while a corrupt/revoked one
+        doesn't stall startup forever. The interactive flow is serialized with a
+        menu "Add account…" via _auth_lock so two browser windows can't open at
+        once.
         """
         self._update_state(kind="authorizing")
         try:
-            if accounts.migrate_legacy_token():
-                return True
+            migrated = accounts.migrate_legacy_token()
         except Exception:  # noqa: BLE001 — migration must never crash the worker
-            pass
+            migrated = None
+        if migrated:
+            self._stamp_accountless_entries(accounts.default_key())
+            return True
         if accounts.list_accounts():
             return True
+        # A legacy token is present but migration hasn't succeeded yet: defer a
+        # few cycles so a transient failure recovers without forcing re-auth.
+        if config.TOKEN_PATH.exists() and self._migrate_attempts < MIGRATE_DEFER_MAX:
+            self._migrate_attempts += 1
+            return False  # stays in "authorizing"; no error glyph for a transient defer
+        # Serialize with the menu add so we never open a second browser window.
+        if not self._auth_lock.acquire(blocking=False):
+            return False  # an interactive add is already running; retry next cycle
         try:
+            if accounts.list_accounts():   # the menu add may have just created one
+                return True
             accounts.authorize_new_account()
+            self._stamp_accountless_entries(accounts.default_key())
             return True
         except AuthFlowError as exc:
             with self._lock:
@@ -450,6 +473,27 @@ class DocToPDFController(NSObject):
         except Exception as exc:  # noqa: BLE001
             self._set_error(f"Auth error: {exc}")
             return False
+        finally:
+            self._auth_lock.release()
+
+    @objc.python_method
+    def _stamp_accountless_entries(self, email) -> None:
+        """Bind watch entries that predate multi-account (no ``account`` key) to
+        ``email`` — the migrated/first account — so they keep fetching with the
+        right identity and participate in orphan handling if it's later removed.
+        Web targets are left untouched."""
+        if not email:
+            return
+        changed = False
+        with self._lock:
+            for e in self._watch:
+                if e.get("kind") != "web" and not e.get("account"):
+                    e["account"] = email
+                    changed = True
+            if changed:
+                self._config["watch"] = list(self._watch)
+        if changed:
+            config.save_config(self._config)
 
     @objc.python_method
     def _service_for(self, account_key):
@@ -503,6 +547,7 @@ class DocToPDFController(NSObject):
         """
         targets, entry_names, errors, seen = [], {}, [], set()
         known_accounts = {a.get("email") for a in accounts.list_accounts()}
+        default_key = accounts.default_key()
 
         def add(fid, name, modified, gtype, overrides, who=None, rag_flag=None, account=None):
             if fid in seen:
@@ -511,6 +556,10 @@ class DocToPDFController(NSObject):
             targets.append({"kind": "drive", "id": fid, "name": name or fid,
                             "modified": modified, "gtype": gtype, "overrides": overrides,
                             "who": who, "rag": rag_flag, "account": account})
+
+        def fail(fid, msg):
+            entry_names[fid] = f"⚠️ {fid[:8]}…: {msg}"
+            errors.append(f"{fid[:8]}…: {msg}")
 
         def editor(m):
             return (m.get("lastModifyingUser") or {}).get("displayName")
@@ -547,17 +596,17 @@ class DocToPDFController(NSObject):
             # a different identity — flag it clearly so the user can re-add or
             # reassign it (Accounts ▸), and move on without aborting the others.
             if acct_key and acct_key not in known_accounts:
-                msg = f"account {acct_key} no longer authorized — re-add or reassign"
-                entry_names[fid] = f"⚠️ {fid[:8]}…: {msg}"
-                errors.append(f"{fid[:8]}…: {msg}")
+                fail(fid, f"account {acct_key} no longer authorized — re-add or reassign")
                 continue
+            key = acct_key or default_key
             try:
                 service = self._service_for(acct_key)
             except AccountAuthError as exc:
-                entry_names[fid] = f"⚠️ {fid[:8]}…: {exc}"
-                errors.append(f"{fid[:8]}…: {exc}")
+                # Record the per-account error so the Accounts row shows ⚠️ and
+                # offers targeted re-auth (a revoked/expired token surfaces here).
+                self._drop_account(key, str(exc))
+                fail(fid, str(exc))
                 continue
-            key = acct_key or accounts.default_key()
             try:
                 meta = drive.get_file_metadata(service, fid)
                 with self._lock:
@@ -587,11 +636,9 @@ class DocToPDFController(NSObject):
                 # service so the next cycle refreshes it, and report per-target —
                 # never bubble up and disturb the other accounts.
                 self._drop_account(key, str(exc))
-                entry_names[fid] = f"⚠️ {fid[:8]}…: {exc}"
-                errors.append(f"{fid[:8]}…: {exc}")
+                fail(fid, str(exc))
             except DriveError as exc:
-                entry_names[fid] = f"⚠️ {fid[:8]}…: {exc}"
-                errors.append(f"{fid[:8]}…: {exc}")
+                fail(fid, str(exc))
 
         # Disambiguate distinct files that share a name (e.g. two "Untitled
         # document"s) so their outputs/versions/commits never collide.
@@ -688,6 +735,8 @@ class DocToPDFController(NSObject):
             service = self._service_for(t.get("account"))
             result = pipeline.run_export(cfg, service, fid, name, gtype)
         except AccountAuthError as exc:
+            # Record it so the account's row offers targeted re-auth.
+            self._drop_account(t.get("account"), str(exc))
             return str(exc)
         except ReauthRequired as exc:
             self._drop_account(t.get("account"), str(exc))
@@ -1557,7 +1606,7 @@ class DocToPDFController(NSObject):
                     self._reassign_orphans(email, dest)
             elif choice == NSAlertSecondButtonReturn:
                 self._remove_orphan_entries(email)
-            # NSAlertThirdButtonReturn ("Keep") → leave them; they error on resolve.
+            # Third button ("Keep") → leave them; they're flagged on resolve.
         else:
             alert.setMessageText_(f"{n} {plural} orphaned")
             alert.setInformativeText_(

@@ -76,6 +76,24 @@ def parse_doc_id(text: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+def fsync_dir(path: Path) -> None:
+    """Best-effort fsync of a directory so a rename inside it is durable.
+
+    ``os.replace`` makes a swap atomic but not necessarily durable across a crash
+    until the *directory* entry is flushed; callers that delete a source file
+    after writing a replacement (e.g. token migration) rely on this so a power
+    loss can't leave the replacement's directory entry unwritten.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def write_token(path: Path, creds: Credentials) -> None:
     """Atomically write credentials to ``path`` with 0600 perms.
 
@@ -100,6 +118,7 @@ def write_token(path: Path, creds: Credentials) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        fsync_dir(path.parent)  # make the rename durable before any source delete
     except BaseException:
         try:
             os.unlink(tmp)

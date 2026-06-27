@@ -23,10 +23,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
@@ -35,6 +37,11 @@ from . import config, drive
 # Per-account tokens + the index live next to the shared client_secret.json.
 TOKENS_DIR = config.PROJECT_ROOT / "tokens"
 ACCOUNTS_PATH = config.PROJECT_ROOT / "accounts.json"
+
+# Serializes read-modify-write of the index so concurrent mutators (worker,
+# menu, and the background auth thread) can't lose an update. Reads don't need
+# it — _save swaps the file atomically (os.replace) so readers never tear.
+_index_lock = threading.Lock()
 
 
 class AccountAuthError(drive.DriveError):
@@ -93,7 +100,10 @@ def _save(accounts: list[dict]) -> None:
     tmp = ACCOUNTS_PATH.with_name(ACCOUNTS_PATH.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump({"accounts": accounts}, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, ACCOUNTS_PATH)
+    drive.fsync_dir(ACCOUNTS_PATH.parent)  # make the rename durable before callers proceed
     try:
         os.chmod(ACCOUNTS_PATH, 0o600)
     except OSError:
@@ -157,12 +167,13 @@ def token_path_for(email: str) -> Path:
 
 
 def set_default(email: str) -> None:
-    accounts = _load()
-    if not any(a.get("email") == email for a in accounts):
-        return
-    for a in accounts:
-        a["is_default"] = (a.get("email") == email)
-    _save(accounts)
+    with _index_lock:
+        accounts = _load()
+        if not any(a.get("email") == email for a in accounts):
+            return
+        for a in accounts:
+            a["is_default"] = (a.get("email") == email)
+        _save(accounts)
 
 
 # ---------------------------------------------------------------------------
@@ -200,9 +211,13 @@ def credentials_for(email: Optional[str] = None) -> Credentials:
             creds.refresh(Request())
             drive.write_token(path, creds)
             return creds
-        except Exception as exc:  # noqa: BLE001 — revoked/expired refresh token, etc.
+        except RefreshError as exc:
+            # The refresh token itself is revoked/expired — genuinely needs re-auth.
             raise AccountAuthError(
                 f"{acct['email']}: session expired — re-authorize this account.") from exc
+        except Exception as exc:  # noqa: BLE001 — transient network/transport: retry, don't re-auth
+            raise drive.DriveError(
+                f"{acct['email']}: network error — will retry.") from exc
     raise AccountAuthError(f"{acct['email']}: re-authorization required.")
 
 
@@ -238,24 +253,27 @@ def authorize_new_account() -> dict:
     Returns the account dict. Propagates :class:`drive.AuthFlowError` (cancelled)
     and :class:`drive.DriveError` (e.g. offline identify / admin-blocked).
     """
+    # The slow browser round-trip runs outside the index lock; only the
+    # read-modify-write of the index below is serialized.
     creds = drive.run_install_flow()
     info = identify(creds)
     email, pid = info["email"], info["permission_id"]
 
-    accounts = _load()
-    existing = next((a for a in accounts if a.get("permission_id") == pid), None)
-    if existing is not None:
-        drive.write_token(TOKENS_DIR / existing["token_file"], creds)
-        existing["email"] = email           # display email may have changed
-        acct = existing
-    else:
-        token_file = _alloc_token_file(email, pid, accounts)
-        drive.write_token(TOKENS_DIR / token_file, creds)
-        acct = {"email": email, "permission_id": pid, "token_file": token_file,
-                "added_at": _now(), "is_default": not accounts}
-        accounts.append(acct)
-    _ensure_one_default(accounts)
-    _save(accounts)
+    with _index_lock:
+        accounts = _load()
+        existing = next((a for a in accounts if a.get("permission_id") == pid), None)
+        if existing is not None:
+            drive.write_token(TOKENS_DIR / existing["token_file"], creds)
+            existing["email"] = email           # display email may have changed
+            acct = existing
+        else:
+            token_file = _alloc_token_file(email, pid, accounts)
+            drive.write_token(TOKENS_DIR / token_file, creds)
+            acct = {"email": email, "permission_id": pid, "token_file": token_file,
+                    "added_at": _now(), "is_default": not accounts}
+            accounts.append(acct)
+        _ensure_one_default(accounts)
+        _save(accounts)
     return acct
 
 
@@ -264,16 +282,16 @@ def remove_account(email: str) -> list[dict]:
 
     Returns the remaining accounts (the caller handles any orphaned targets).
     """
-    accounts = _load()
-    acct = next((a for a in accounts if a.get("email") == email), None)
-    if acct is None:
-        return accounts
-    _safe_unlink(TOKENS_DIR / acct["token_file"])
-    remaining = [a for a in accounts if a.get("email") != email]
-    if acct.get("is_default") and remaining:
-        remaining[0]["is_default"] = True
-    _ensure_one_default(remaining)
-    _save(remaining)
+    with _index_lock:
+        accounts = _load()
+        acct = next((a for a in accounts if a.get("email") == email), None)
+        if acct is None:
+            return accounts
+        _safe_unlink(TOKENS_DIR / acct["token_file"])
+        remaining = [a for a in accounts if a.get("email") != email]
+        # _ensure_one_default promotes a new default when the removed one was it.
+        _ensure_one_default(remaining)
+        _save(remaining)
     return remaining
 
 
@@ -310,20 +328,27 @@ def migrate_legacy_token() -> Optional[dict]:
         return None  # offline / transient — defer to the next successful run
 
     email, pid = info["email"], info["permission_id"]
-    accounts = _load()
-    existing = next((a for a in accounts if a.get("permission_id") == pid), None)
-    if existing is not None:
-        # Already migrated on a prior run; just clear the stale legacy file.
-        _safe_unlink(legacy)
-        return existing
+    with _index_lock:
+        accounts = _load()
+        existing = next((a for a in accounts if a.get("permission_id") == pid), None)
+        if existing is not None:
+            # Already migrated on a prior run. Only drop the legacy file once a
+            # per-account copy is confirmed on disk — if it went missing (and we
+            # hold a valid legacy token), restore it first so we never delete the
+            # last working credential.
+            dest = TOKENS_DIR / existing["token_file"]
+            if not dest.exists():
+                drive.write_token(dest, creds)
+            _safe_unlink(legacy)
+            return existing
 
-    token_file = _alloc_token_file(email, pid, accounts)
-    drive.write_token(TOKENS_DIR / token_file, creds)  # atomic; confirmed on return
-    acct = {"email": email, "permission_id": pid, "token_file": token_file,
-            "added_at": _now(), "is_default": not accounts}
-    accounts.append(acct)
-    _ensure_one_default(accounts)
-    _save(accounts)
-    # Migrated copy is written + registered — now it's safe to drop the legacy.
-    _safe_unlink(legacy)
+        token_file = _alloc_token_file(email, pid, accounts)
+        drive.write_token(TOKENS_DIR / token_file, creds)  # atomic; confirmed on return
+        acct = {"email": email, "permission_id": pid, "token_file": token_file,
+                "added_at": _now(), "is_default": not accounts}
+        accounts.append(acct)
+        _ensure_one_default(accounts)
+        _save(accounts)
+        # Migrated copy is written + registered — now it's safe to drop the legacy.
+        _safe_unlink(legacy)
     return acct

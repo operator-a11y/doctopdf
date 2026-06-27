@@ -19,11 +19,18 @@ from doctopdf import accounts, config, drive
 class FakeCreds:
     """Minimal stand-in for google's Credentials (only what the code touches)."""
 
-    def __init__(self, tag="t", valid=True, expired=False, refresh_token="r"):
+    def __init__(self, tag="t", valid=True, expired=False, refresh_token="r", refresh_exc=None):
         self._tag = tag
         self.valid = valid
         self.expired = expired
         self.refresh_token = refresh_token
+        self.refresh_exc = refresh_exc
+
+    def refresh(self, request):
+        if self.refresh_exc:
+            raise self.refresh_exc
+        self.valid = True
+        self.expired = False
 
     def to_json(self):
         return json.dumps({"token": self._tag, "refresh_token": self.refresh_token})
@@ -170,6 +177,46 @@ class AccountsStorageTests(unittest.TestCase):
         StubCreds.to_return = None   # loader raises ValueError → AccountAuthError
         with self.assertRaises(accounts.AccountAuthError):
             accounts.credentials_for("alice@x.com")
+
+    def test_credentials_for_revoked_refresh_requires_reauth(self):
+        from google.auth.exceptions import RefreshError
+        self.identity["c1"] = ("alice@x.com", "PID-A")
+        self._flow_returns(FakeCreds(tag="c1"))
+        accounts.authorize_new_account()
+        StubCreds.to_return = FakeCreds(valid=False, expired=True,
+                                        refresh_exc=RefreshError("invalid_grant"))
+        with self.assertRaises(accounts.AccountAuthError):
+            accounts.credentials_for("alice@x.com")
+
+    def test_credentials_for_transient_refresh_is_retryable_not_reauth(self):
+        from google.auth.exceptions import TransportError
+        self.identity["c1"] = ("alice@x.com", "PID-A")
+        self._flow_returns(FakeCreds(tag="c1"))
+        accounts.authorize_new_account()
+        StubCreds.to_return = FakeCreds(valid=False, expired=True,
+                                        refresh_exc=TransportError("dns blip"))
+        with self.assertRaises(drive.DriveError) as cm:
+            accounts.credentials_for("alice@x.com")
+        # A transient network error must NOT be classified as "re-authorize".
+        self.assertNotIsInstance(cm.exception, accounts.AccountAuthError)
+
+    def test_migrate_restores_missing_per_account_copy_before_unlinking_legacy(self):
+        # Register an account, then lose its per-account token file on disk.
+        self.identity["c1"] = ("alice@x.com", "PID-A")
+        self._flow_returns(FakeCreds(tag="c1"))
+        acct = accounts.authorize_new_account()
+        dest = accounts.TOKENS_DIR / acct["token_file"]
+        dest.unlink()
+        self.assertFalse(dest.exists())
+        # A legacy token.json for the SAME account reappears.
+        config.TOKEN_PATH.write_text(FakeCreds(tag="legacy").to_json())
+        self.identity["legacy"] = ("alice@x.com", "PID-A")
+        StubCreds.to_return = FakeCreds(tag="legacy", valid=True)
+        again = accounts.migrate_legacy_token()
+        self.assertEqual(again["permission_id"], "PID-A")
+        self.assertTrue(dest.exists(), "the missing per-account copy is restored")
+        self.assertFalse(config.TOKEN_PATH.exists(), "legacy removed only after the copy exists")
+        self.assertEqual(len(accounts.list_accounts()), 1)
 
     # -- migration ---------------------------------------------------------
     def test_migrate_no_legacy_is_noop(self):
@@ -338,6 +385,8 @@ class PerTargetCredentialTests(unittest.TestCase):
         self.assertIn("d1", ids, "the healthy account still resolves")
         self.assertNotIn("d2", ids)
         self.assertTrue(any("d2" in e for e in errors))
+        # The stale account is recorded so its Accounts row can offer re-auth.
+        self.assertIn("B@x.com", ctl._account_errors)
 
     def test_orphaned_target_unknown_account_is_flagged_not_fetched(self):
         ctl = self._ctl()
@@ -391,6 +440,85 @@ class OrphanHandlingTests(unittest.TestCase):
                          {"id": "d2", "account": "B"}])
         ctl._reassign_orphans("A", "B")
         self.assertEqual([e.get("account") for e in ctl._watch], ["B", "B"])
+
+
+class BootstrapAndStampTests(unittest.TestCase):
+    """Worker bootstrap defers a not-yet-migrated legacy token instead of forcing
+    re-auth, and stamps legacy accountless watch entries onto the migrated account."""
+
+    def setUp(self):
+        from doctopdf import app, config as _config
+        self.app = app
+        self.C = app.DocToPDFController
+        self._config = _config
+        self.tmp = Path(tempfile.mkdtemp())
+        self._orig = {
+            "migrate": accounts.migrate_legacy_token,
+            "list": accounts.list_accounts,
+            "authorize": accounts.authorize_new_account,
+            "default_key": accounts.default_key,
+            "TOKEN_PATH": _config.TOKEN_PATH,
+            "save_config": _config.save_config,
+        }
+        _config.save_config = lambda c: None
+
+    def tearDown(self):
+        accounts.migrate_legacy_token = self._orig["migrate"]
+        accounts.list_accounts = self._orig["list"]
+        accounts.authorize_new_account = self._orig["authorize"]
+        accounts.default_key = self._orig["default_key"]
+        self._config.TOKEN_PATH = self._orig["TOKEN_PATH"]
+        self._config.save_config = self._orig["save_config"]
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _ctl(self):
+        ctl = type("Ctl", (), {})()
+        ctl._lock = threading.RLock()
+        ctl._auth_lock = threading.Lock()
+        ctl._auth_blocked = False
+        ctl._migrate_attempts = 0
+        ctl.states, ctl.errors, ctl.stamped = [], [], []
+        ctl._update_state = lambda **k: ctl.states.append(k)
+        ctl._set_error = lambda m: ctl.errors.append(m)
+        ctl._stamp_accountless_entries = lambda email: ctl.stamped.append(email)
+        return ctl
+
+    def test_bootstrap_defers_legacy_then_falls_back_to_interactive(self):
+        accounts.migrate_legacy_token = lambda: None
+        accounts.list_accounts = lambda: []
+        accounts.default_key = lambda: "alice@x.com"
+        legacy = self.tmp / "token.json"
+        legacy.write_text("{}")
+        self._config.TOKEN_PATH = legacy
+
+        def boom():
+            raise AssertionError("must not run interactive auth while deferring")
+
+        accounts.authorize_new_account = boom
+        ctl = self._ctl()
+        # First MIGRATE_DEFER_MAX cycles defer (no re-auth) and count up.
+        for i in range(self.app.MIGRATE_DEFER_MAX):
+            self.assertFalse(self.C._bootstrap_account(ctl))
+        self.assertEqual(ctl._migrate_attempts, self.app.MIGRATE_DEFER_MAX)
+
+        # After the bound is exhausted, it falls back to interactive auth.
+        called = []
+        accounts.authorize_new_account = lambda: called.append(1) or {"email": "alice@x.com"}
+        self.assertTrue(self.C._bootstrap_account(ctl))
+        self.assertEqual(called, [1])
+        self.assertIn("alice@x.com", ctl.stamped)
+
+    def test_stamp_accountless_entries_binds_only_unbound_drive_entries(self):
+        ctl = type("Ctl", (), {})()
+        ctl._lock = threading.RLock()
+        ctl._watch = [{"id": "d1"},                       # legacy, unbound
+                      {"id": "d2", "account": "keep@x"},  # already bound
+                      {"kind": "web", "id": "u"}]          # web: no account
+        ctl._config = {}
+        self.C._stamp_accountless_entries(ctl, "alice@x.com")
+        self.assertEqual(ctl._watch[0]["account"], "alice@x.com")
+        self.assertEqual(ctl._watch[1]["account"], "keep@x")
+        self.assertNotIn("account", ctl._watch[2])
 
 
 if __name__ == "__main__":
