@@ -1,0 +1,27 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html {
+  scroll-behavior: smooth;
+  /* Offset anchor jumps so they don't hide under the sticky header. */
+  scroll-padding-top: 5rem;
+}
+
+body {
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+::selection {
+  background: rgb(129 140 248 / 0.35); /* indigo-400 */
+}
+
+/* Visible keyboard-focus ring on the dark theme (WCAG 2.4.7). */
+:focus-visible {
+  outline: 2px solid rgb(129 140 248); /* indigo-400 */
+  outline-offset: 2px;
+  border-radius: 6px;
+}
