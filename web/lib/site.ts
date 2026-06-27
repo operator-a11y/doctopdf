@@ -14,5 +14,6 @@ export const site = {
   // The releases listing page (all versions + notes).
   releases: "https://github.com/operator-a11y/doctopdf/releases",
   readme: "https://github.com/operator-a11y/doctopdf#readme",
-  setup: "https://github.com/operator-a11y/doctopdf#one-time-google-cloud-setup-you-must-do-this-once",
+  // The click-by-click Google OAuth walkthrough (a page on this site).
+  setup: "/setup",
 } as const;

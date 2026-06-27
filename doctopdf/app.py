@@ -80,6 +80,10 @@ RAG_RETRY_CAP = 600          # max backoff while the embedder stays down
 # corrupt/revoked one doesn't stall startup forever.
 MIGRATE_DEFER_MAX = 3
 
+# Where the "Set up Google access…" helper sends users for the one-time
+# OAuth-client walkthrough.
+SETUP_URL = "https://doctopdf-pi.vercel.app/setup"
+
 PUB_RETRY_BASE = 30          # seconds before the first publish (push) retry
 PUB_RETRY_CAP = 900          # max backoff while a push keeps failing
 RECENT_PUB_MAX = 15          # entries kept in the "Recent publishes" list
@@ -141,7 +145,9 @@ class DocToPDFController(NSObject):
             "rag_count": None,              # indexed chunk count (None = RAG off)
             "rag_last_sync": None,          # last time the index changed
             "rag_note": None,              # degraded note (embedder down / reindex)
+            "needs_setup": False,          # client_secret.json missing → show the helper once
         }
+        self._setup_prompt_shown = False    # first-run setup helper shown this session
 
         # --- RAG / vector sync plumbing ------------------------------------
         # A single worker thread drains a queue of sync/delete tasks, so store
@@ -305,6 +311,7 @@ class DocToPDFController(NSObject):
             "Accounts", None, "")
         self._mi_accounts.setSubmenu_(self._accounts_menu)
         menu.addItem_(self._mi_accounts)
+        action("Set up Google access…", "onSetupGuide:")
 
         self._mi_pubnow = action("Publish now", "onPublishNow:")
         self._mi_pubnow.setHidden_(True)    # shown only when publish targets exist
@@ -368,10 +375,13 @@ class DocToPDFController(NSObject):
                         self._update_state(kind="paused")
                     self._sleep_or_wake(interval)
                     continue
-                if not config.CLIENT_SECRET_PATH.exists():
-                    self._set_error("Missing client_secret.json — see README.")
+                if not config.client_secret_path().exists():
+                    self._update_state(
+                        kind="error", needs_setup=True,
+                        error_msg="Add your Google credentials — “Set up Google access…”")
                     self._sleep_or_wake(max(interval, 10))
                     continue
+                self._update_state(needs_setup=False)  # credentials are present now
                 if not self._bootstrap_account():   # migrate or interactive add
                     self._sleep_or_wake(interval)
                     continue
@@ -1263,6 +1273,13 @@ class DocToPDFController(NSObject):
             watch_entries = list(self._watch)
             entry_names = dict(self._entry_names)
 
+        # First run with no credentials yet: proactively walk the user through
+        # setup, exactly once per launch (main thread — safe to show a modal).
+        if st.get("needs_setup") and not self._setup_prompt_shown:
+            self._setup_prompt_shown = True
+            self._show_setup_helper()
+            return
+
         kind = st["kind"]
         err = st["error_msg"]
         names = st.get("names") or []
@@ -1838,6 +1855,38 @@ class DocToPDFController(NSObject):
                 )
         except Exception as exc:  # noqa: BLE001
             self._alert("Couldn't change Login setting", str(exc))
+
+    def onSetupGuide_(self, _sender) -> None:
+        self._show_setup_helper()
+
+    @objc.python_method
+    def _show_setup_helper(self) -> None:
+        """Walk a new user through adding their own Google OAuth credentials:
+        a button to the step-by-step guide and one that reveals the exact folder
+        to drop ``client_secret.json`` into."""
+        folder = config.APP_SUPPORT_DIR
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Connect DocToPDF to Google")
+        alert.setInformativeText_(
+            "DocToPDF uses your own Google credentials (one-time, ~5 min):\n\n"
+            "1. Click “Open Setup Guide” and follow it to create a Desktop OAuth "
+            "client in Google Cloud, then download its client_secret.json.\n"
+            "2. Click “Reveal Folder” and move client_secret.json into it:\n"
+            f"      {folder}\n\n"
+            "DocToPDF then prompts you to sign in. Your credentials stay on your Mac.")
+        alert.addButtonWithTitle_("Open Setup Guide")
+        alert.addButtonWithTitle_("Reveal Folder")
+        alert.addButtonWithTitle_("Close")
+        resp = alert.runModal()
+        if resp == NSAlertFirstButtonReturn:
+            subprocess.run(["open", SETUP_URL], check=False)
+        elif resp == NSAlertSecondButtonReturn:
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            subprocess.run(["open", str(folder)], check=False)
 
     def onQuit_(self, _sender) -> None:
         self._stop.set()

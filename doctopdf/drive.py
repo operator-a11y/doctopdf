@@ -177,14 +177,13 @@ def run_install_flow() -> Credentials:
     if the flow itself fails (e.g. the user closes the window). The caller is
     responsible for persisting the returned token.
     """
-    if not config.CLIENT_SECRET_PATH.exists():
+    secret = config.client_secret_path()
+    if not secret.exists():
         raise DriveError(
             "Missing client_secret.json — see the README to create OAuth credentials."
         )
     try:
-        flow = InstalledAppFlow.from_client_secrets_file(
-            str(config.CLIENT_SECRET_PATH), config.SCOPES
-        )
+        flow = InstalledAppFlow.from_client_secrets_file(str(secret), config.SCOPES)
         return flow.run_local_server(port=0)
     except Exception as exc:  # noqa: BLE001 — surface any flow failure as a clean message
         raise AuthFlowError(f"Authorization failed: {exc}") from exc

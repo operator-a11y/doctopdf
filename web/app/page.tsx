@@ -251,7 +251,7 @@ export default function Home() {
                   · Needs your own <span className="text-white">Google Cloud OAuth client</span>{" "}
                   (<code className="rounded bg-white/10 px-1 py-0.5 font-mono text-xs">client_secret.json</code>) —
                   a one-time setup covered step by step in the{" "}
-                  <a href={site.setup} className="text-amber-200 underline underline-offset-2 hover:text-amber-100">README</a>.
+                  <Link href={site.setup} className="text-amber-200 underline underline-offset-2 hover:text-amber-100">setup guide</Link>.
                 </li>
                 <li>· Optional: <span className="text-white">Ollama</span> for local AI summaries and the knowledge base.</li>
               </ul>
@@ -276,7 +276,8 @@ export default function Home() {
                   Grab the latest macOS build — <span className="text-neutral-200">universal2,
                   native on Apple silicon &amp; Intel</span>. It&apos;s an unsigned preview, so on
                   first open right-click the app → Open. You also add your own Google OAuth
-                  client once — see the setup guide.
+                  client once — see the{" "}
+                  <Link href={site.setup} className="text-neutral-200 underline underline-offset-2 hover:text-white">setup guide</Link>.
                 </p>
                 <a
                   href={site.download}
@@ -307,7 +308,7 @@ python -m doctopdf`}
                   href={site.readme}
                   className="mt-6 inline-flex items-center justify-center gap-2 rounded-full border border-white/15 bg-white/5 px-6 py-3 text-sm font-semibold text-white transition-colors hover:bg-white/10"
                 >
-                  Read the setup guide <ArrowRight className="h-4 w-4" />
+                  Open the README <ArrowRight className="h-4 w-4" />
                 </a>
               </div>
             </div>
@@ -326,6 +327,7 @@ python -m doctopdf`}
             <a href={site.repo} className="transition-colors hover:text-white">GitHub</a>
             <a href={site.readme} className="transition-colors hover:text-white">Docs</a>
             <a href={site.releases} className="transition-colors hover:text-white">Releases</a>
+            <Link href="/setup" className="transition-colors hover:text-white">Setup</Link>
             <Link href="/privacy" className="transition-colors hover:text-white">Privacy</Link>
           </div>
         </div>

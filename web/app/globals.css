@@ -25,3 +25,20 @@ body {
   outline-offset: 2px;
   border-radius: 6px;
 }
+
+/* Small reusable helpers used in the setup/privacy prose. */
+.lnk {
+  color: rgb(129 140 248);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.lnk:hover {
+  color: rgb(165 180 252);
+}
+.code {
+  border-radius: 4px;
+  background: rgb(255 255 255 / 0.1);
+  padding: 0.1rem 0.3rem;
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 0.8em;
+}

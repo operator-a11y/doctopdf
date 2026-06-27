@@ -30,18 +30,19 @@ CONFIG_PATH = APP_SUPPORT_DIR / "config.json"
 TOKEN_PATH = PROJECT_ROOT / "token.json"
 
 
-def _resolve_client_secret_path() -> Path:
+def client_secret_path() -> Path:
     """Locate the OAuth ``client_secret.json``, in priority order:
 
     1. A user-supplied copy in the app-support dir — lets anyone drop in their own
-       OAuth client without touching the bundle.
+       OAuth client without touching the bundle (the path for the packaged app).
     2. The copy embedded inside the packaged ``.app`` (``Contents/Resources``) —
-       so a distributed build ships its own OAuth client and end users do no
-       Google setup.
+       so a distributed build can ship its own OAuth client.
     3. The project root — for running from source.
 
-    Returns the first that exists; otherwise the project-root path (so the
-    "Missing client_secret.json" guidance still points somewhere sensible).
+    Resolved **live** on each call (not cached), so a file dropped in at runtime
+    is picked up on the next poll without a restart. Returns the first that
+    exists; otherwise the project-root path (so the "Missing client_secret.json"
+    guidance still points somewhere sensible).
     """
     user = APP_SUPPORT_DIR / "client_secret.json"
     if user.exists():
@@ -54,7 +55,9 @@ def _resolve_client_secret_path() -> Path:
     return PROJECT_ROOT / "client_secret.json"
 
 
-CLIENT_SECRET_PATH = _resolve_client_secret_path()
+# Back-compat snapshot (some call sites import the constant); prefer the live
+# client_secret_path() for existence checks that may change at runtime.
+CLIENT_SECRET_PATH = client_secret_path()
 
 # OAuth scope — read-only Drive covers both metadata reads and PDF export.
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
