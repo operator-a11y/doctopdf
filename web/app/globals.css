@@ -42,3 +42,12 @@ body {
   font-family: var(--font-geist-mono), ui-monospace, monospace;
   font-size: 0.8em;
 }
+
+/* Cross-fade for the animated menu-bar demo (MenuDemo). */
+@keyframes demoFade {
+  from { opacity: 0.35; }
+  to { opacity: 1; }
+}
+.demo-fade {
+  animation: demoFade 0.5s ease;
+}

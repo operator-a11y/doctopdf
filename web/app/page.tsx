@@ -1,4 +1,5 @@
 import Link from "next/link";
+import MenuDemo from "@/components/MenuDemo";
 import {
   ArrowRight,
   Bell,
@@ -167,33 +168,9 @@ export default function Home() {
               </p>
             </div>
 
-            {/* Menu-bar preview (decorative — described for screen readers) */}
+            {/* Animated menu-bar demo (cycles through watching → exporting → change). */}
             <div className="mx-auto mt-16 max-w-md">
-              <span className="sr-only">
-                Example of the DocToPDF menu-bar dropdown: watching 5 items, the last export
-                time, a material pricing change summary, Export now, an Accounts submenu, and
-                Change history.
-              </span>
-              <div
-                aria-hidden
-                className="overflow-hidden rounded-xl border border-white/10 bg-neutral-900/80 shadow-2xl shadow-black/40"
-              >
-                <div className="flex items-center gap-1.5 border-b border-white/5 px-4 py-2.5">
-                  <span className="h-2.5 w-2.5 rounded-full bg-red-400/80" />
-                  <span className="h-2.5 w-2.5 rounded-full bg-yellow-400/80" />
-                  <span className="h-2.5 w-2.5 rounded-full bg-green-400/80" />
-                </div>
-                <pre className="overflow-x-auto px-5 py-4 font-mono text-[13px] leading-relaxed text-neutral-300">
-{`DocToPDF
- ├─ Watching: 5 items
- ├─ Last export: 14:32:07
- ├─ 💡 Pricing: [material] $20 → $35/mo
- ├─ Export now
- ├─ Accounts ▸   personal ✓ · work
- ├─ Change history…
- └─ Quit`}
-                </pre>
-              </div>
+              <MenuDemo />
             </div>
           </div>
         </section>
