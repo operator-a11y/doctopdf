@@ -127,6 +127,18 @@ class AccountsStorageTests(unittest.TestCase):
         self.assertTrue(remaining[0]["is_default"], "a new default must be promoted")
         self.assertFalse(token1.exists(), "the removed account's token is deleted")
 
+    def test_set_default_moves_the_marker(self):
+        self.identity["c1"] = ("alice@x.com", "PID-A")
+        self.identity["c2"] = ("bob@y.com", "PID-B")
+        self._flow_returns(FakeCreds(tag="c1"), FakeCreds(tag="c2"))
+        accounts.authorize_new_account()
+        accounts.authorize_new_account()
+        self.assertEqual(accounts.default_key(), "alice@x.com")
+        accounts.set_default("bob@y.com")
+        self.assertEqual(accounts.default_key(), "bob@y.com")
+        # exactly one default remains
+        self.assertEqual(sum(1 for a in accounts.list_accounts() if a["is_default"]), 1)
+
     # -- credentials_for ---------------------------------------------------
     def test_credentials_for_no_accounts_raises(self):
         with self.assertRaises(accounts.AccountAuthError):

@@ -181,6 +181,10 @@ class DocToPDFController(NSObject):
         self._svc: dict = {}                # account email -> Drive service
         self._svc_creds: dict = {}          # account email -> Credentials
         self._account_errors: dict = {}     # account email -> last auth error msg
+        # Serializes the interactive OAuth flow so the worker's bootstrap and a
+        # menu "Add account…" can't pop two browser windows at once.
+        self._auth_lock = threading.Lock()
+        self._accounts_sig = None           # last-rendered Accounts submenu signature
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._worker = threading.Thread(target=self._run_worker, name="watch", daemon=True)
@@ -283,6 +287,16 @@ class DocToPDFController(NSObject):
         menu.addItem_(NSMenuItem.separatorItem())
         self._mi_pause = action("Pause", "onTogglePause:")
         action("Add Doc or Folder…", "onAddTarget:")
+
+        # "Accounts ▸" submenu: authorized Google accounts (✓ = default; click to
+        # set default), plus Add / Remove account. Rebuilt by the UI timer.
+        self._accounts_menu = NSMenu.alloc().init()
+        self._accounts_menu.setAutoenablesItems_(False)
+        self._mi_accounts = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Accounts", None, "")
+        self._mi_accounts.setSubmenu_(self._accounts_menu)
+        menu.addItem_(self._mi_accounts)
+
         self._mi_pubnow = action("Publish now", "onPublishNow:")
         self._mi_pubnow.setHidden_(True)    # shown only when publish targets exist
         action("Change history…", "onAuditHistory:")
@@ -385,8 +399,9 @@ class DocToPDFController(NSObject):
                 # Safety net: a stale credential slipped past the per-account
                 # handling in resolve/poll. Drop all cached services so the next
                 # cycle rebuilds/refreshes them (per-account, lazily).
-                self._svc.clear()
-                self._svc_creds.clear()
+                with self._lock:
+                    self._svc.clear()
+                    self._svc_creds.clear()
                 self._set_error(str(exc))
             except DriveError as exc:
                 self._set_error(str(exc))
@@ -445,14 +460,16 @@ class DocToPDFController(NSObject):
         key = account_key or accounts.default_key()
         if key is None:
             raise AccountAuthError("No Google account authorized — add one under Accounts.")
-        svc = self._svc.get(key)
+        with self._lock:
+            svc = self._svc.get(key)
         if svc is not None:
             return svc
+        # Build outside the lock — credentials_for may block on a token refresh.
         creds = accounts.credentials_for(key)
         svc = drive.build_service(creds)
-        self._svc[key] = svc
-        self._svc_creds[key] = creds
         with self._lock:
+            self._svc[key] = svc
+            self._svc_creds[key] = creds
             self._account_errors.pop(key, None)
         return svc
 
@@ -464,10 +481,10 @@ class DocToPDFController(NSObject):
         key = account_key or accounts.default_key()
         if key is None:
             return
-        self._svc.pop(key, None)
-        self._svc_creds.pop(key, None)
-        if msg:
-            with self._lock:
+        with self._lock:
+            self._svc.pop(key, None)
+            self._svc_creds.pop(key, None)
+            if msg:
                 self._account_errors[key] = msg
 
     @objc.python_method
@@ -531,7 +548,8 @@ class DocToPDFController(NSObject):
             key = acct_key or accounts.default_key()
             try:
                 meta = drive.get_file_metadata(service, fid)
-                creds = self._svc_creds.get(key)
+                with self._lock:
+                    creds = self._svc_creds.get(key)
                 if creds is not None:
                     accounts.persist_if_refreshed(key, creds)
                 gtype = pipeline.google_type(meta.get("mimeType"))
@@ -1226,6 +1244,16 @@ class DocToPDFController(NSObject):
             self._rebuild_watch_menu(watch_entries, entry_names)
             self._watch_sig = sig
 
+        # "Accounts ▸" submenu; rebuild only when the set / default / errors change.
+        accts = accounts.list_accounts()
+        with self._lock:
+            acct_errors = dict(self._account_errors)
+        a_sig = repr([(a.get("email"), a.get("is_default")) for a in accts]
+                     + sorted(acct_errors))
+        if a_sig != self._accounts_sig:
+            self._rebuild_accounts_menu(accts, acct_errors)
+            self._accounts_sig = a_sig
+
         # Non-fatal warnings (git/hook + async alert/classify degradation), shown
         # on their own line — not the error glyph. alert_warning isn't cleared by
         # the poll loop, so it persists until the next successful change.
@@ -1366,6 +1394,75 @@ class DocToPDFController(NSObject):
             self._config["watch"] = list(self._watch)
             self._entry_names.pop(fid, None)
         config.save_config(self._config)
+        self._wake.set()
+
+    def onAccountClicked_(self, sender) -> None:
+        """Click an account row → make it the default for new targets."""
+        email = sender.representedObject()
+        if not email:
+            return
+        accounts.set_default(email)
+        with self._lock:
+            self._accounts_sig = None   # force the submenu to re-render the ✓
+        self._wake.set()
+
+    def onAddAccount_(self, _sender) -> None:
+        """Authorize an additional Google account.
+
+        The interactive OAuth flow runs OFF the main thread so the menu never
+        freezes during the browser round-trip; the result is reported via a
+        notification and the worker is woken to pick the new account up. The
+        flow is serialized with the worker's bootstrap so two browser windows
+        can't open at once, and re-adding an existing account just refreshes its
+        token (dedupe by permissionId) rather than duplicating it.
+        """
+        def go():
+            if not self._auth_lock.acquire(blocking=False):
+                self._notify("Add account", "Authorization already in progress.")
+                return
+            try:
+                acct = accounts.authorize_new_account()
+            except AuthFlowError as exc:
+                self._notify("Account not added", str(exc))
+                return
+            except DriveError as exc:
+                self._notify("Account not added", str(exc))
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._notify("Account not added", f"Error: {exc}")
+                return
+            finally:
+                self._auth_lock.release()
+            with self._lock:
+                self._auth_blocked = False
+                self._account_errors.pop(acct.get("email"), None)
+                self._accounts_sig = None
+                self._force = True
+            self._notify("Account added", f"Authorized {acct.get('email')}.")
+            self._wake.set()
+
+        threading.Thread(target=go, name="doctopdf-addaccount", daemon=True).start()
+
+    def onRemoveAccount_(self, sender) -> None:
+        email = sender.representedObject()
+        if not email:
+            return
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Remove account?")
+        alert.setInformativeText_(
+            f"Remove “{email}”? Its saved authorization is deleted; you can "
+            "re-add it later.")
+        alert.addButtonWithTitle_("Remove")
+        alert.addButtonWithTitle_("Cancel")
+        if alert.runModal() != NSAlertFirstButtonReturn:
+            return
+        accounts.remove_account(email)
+        with self._lock:
+            self._svc.pop(email, None)
+            self._svc_creds.pop(email, None)
+            self._account_errors.pop(email, None)
+            self._accounts_sig = None
         self._wake.set()
 
     def onExportNow_(self, _sender) -> None:
@@ -1622,6 +1719,57 @@ class DocToPDFController(NSObject):
             "Click an item to remove it", None, "")
         hint.setEnabled_(False)
         self._watch_menu.addItem_(hint)
+
+    @objc.python_method
+    def _rebuild_accounts_menu(self, accts, errors) -> None:
+        """Rebuild the Accounts submenu (main thread, from refreshUI_).
+
+        Lists each authorized account (✓ marks the default; ⚠️ marks one whose
+        token has gone stale) with a click-to-set-default action, then an
+        "Add account…" item and a "Remove account ▸" submenu.
+        """
+        m = self._accounts_menu
+        m.removeAllItems()
+        if not accts:
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "No accounts authorized", None, "")
+            item.setEnabled_(False)
+            m.addItem_(item)
+        else:
+            for a in accts:
+                email = a.get("email")
+                if errors.get(email):
+                    title = f"⚠️ {email}"
+                    tip = errors.get(email)
+                else:
+                    title = f"{'✓ ' if a.get('is_default') else '   '}{email}"
+                    tip = ("Default account for new targets" if a.get("is_default")
+                           else "Click to make this the default account")
+                item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    title, "onAccountClicked:", "")
+                item.setTarget_(self)
+                item.setRepresentedObject_(email)
+                item.setToolTip_(tip)
+                m.addItem_(item)
+        m.addItem_(NSMenuItem.separatorItem())
+        add = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Add account…", "onAddAccount:", "")
+        add.setTarget_(self)
+        m.addItem_(add)
+        if accts:
+            remove_menu = NSMenu.alloc().init()
+            remove_menu.setAutoenablesItems_(False)
+            for a in accts:
+                email = a.get("email")
+                ri = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    email, "onRemoveAccount:", "")
+                ri.setTarget_(self)
+                ri.setRepresentedObject_(email)
+                remove_menu.addItem_(ri)
+            mi_remove = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Remove account", None, "")
+            mi_remove.setSubmenu_(remove_menu)
+            m.addItem_(mi_remove)
 
     @objc.python_method
     def _rebuild_recent_menu(self, recent) -> None:
