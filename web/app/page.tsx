@@ -286,7 +286,7 @@ export default function Home() {
                   <Download className="h-4 w-4" /> Download for macOS
                 </a>
                 <p className="mt-3 text-xs text-neutral-400">
-                  v0.1.1 · universal2 (macOS 11+) ·{" "}
+                  universal2 · macOS 11+ ·{" "}
                   <a href={site.releases} className="underline underline-offset-2 hover:text-white">all releases</a>
                 </p>
               </div>
