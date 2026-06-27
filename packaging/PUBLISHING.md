@@ -34,25 +34,60 @@ notarytool credentials as GitHub Actions secrets, import the cert into a
 temporary keychain, and insert the sign → notarize → staple steps before the
 upload step in `.github/workflows/release.yml`.
 
-## 2. Google OAuth verification (so anyone can sign in)
+## 2. Google OAuth — embed the client + verify (so anyone can sign in)
 
-Today the OAuth app is in **Testing** mode: only added test users can authorize,
-and the app needs a local `client_secret.json`. To open it to everyone:
+`drive.readonly` is a Google **restricted** scope. The app already ships an
+embedded OAuth client (see "Embedding the client" below), so end users do zero
+Google setup. The remaining work is publishing + verification. Key facts
+(verified against Google docs, June 2026):
 
-1. **Ship an OAuth client with the app.** Desktop ("installed app") OAuth clients
-   are not confidential by design, so bundling a `client_secret.json` inside the
-   `.app` (e.g. `Contents/Resources/`) — or fetching it at first run — is
-   acceptable for this flow.
-2. In **Google Cloud Console → OAuth consent screen**, move from *Testing* to
-   *In production* (**Publish app**).
-3. `drive.readonly` is a **sensitive/restricted** scope, so Google requires
-   **verification**: a privacy-policy URL, an app homepage (your Vercel site
-   works), a demo video, and — for restricted scopes — possibly a third-party
-   **CASA security assessment**. Until verified, users see an "unverified app"
-   warning they must click through.
+| Publishing status | Users | Friction | Google review |
+| --- | --- | --- | --- |
+| Testing | ≤100 (added by hand) | **re-auth every 7 days** | none |
+| In production, **unverified** | ≤100 total (permanent cap) | one-time "unverified app" warning | none |
+| In production, **verified** | unlimited | none | brand verification **+ CASA** |
 
-## Alternative: keep "bring your own client_secret.json"
+### Embedding the client (already wired)
+- `config._resolve_client_secret_path()` finds a `client_secret.json` bundled at
+  `Contents/Resources/` of the `.app` (or one you drop in the app-support dir).
+- `setup.py` bundles `client_secret.json` if it's present at build time.
+- The release CI writes it from a repo secret. **Add it once:** GitHub →
+  repo *Settings → Secrets and variables → Actions → New repository secret*,
+  name **`GOOGLE_CLIENT_SECRET_JSON`**, value = the full contents of your Desktop
+  OAuth client's `client_secret.json`. Then cut a tag — the build embeds it.
+  (Desktop client secrets are non-confidential by Google's own definition, so
+  shipping it in the app is expected.)
 
-If you don't want to embed credentials or go through verification, keep the
-current model — the user creates their own OAuth client (the README walkthrough).
-Great for a developer audience; not turnkey for non-technical users.
+### Verification checklist (for unlimited public users)
+1. **OAuth consent screen → Branding:** app name, logo, **app homepage**
+   (`https://doctopdf-pi.vercel.app`), **privacy policy URL**
+   (`https://doctopdf-pi.vercel.app/privacy` — already built), and **authorized
+   domains**. ⚠️ Authorized domains must be ones you can verify ownership of in
+   Search Console; a `*.vercel.app` subdomain generally won't qualify — you'll
+   likely need a **custom domain** (point it at the Vercel project, then set
+   `site.url` + the consent-screen URLs to it).
+2. **Scopes:** add `drive.readonly`, and write the **limited-use / why-you-need-it
+   justification** (this app exports + diffs the user's chosen Docs; least scope
+   that works).
+3. **Demo video:** an unlisted YouTube link showing the OAuth grant and the app
+   actually using the restricted scope (watching + exporting a Doc).
+4. **Publish app** (Testing → In production) and **submit for verification**.
+   Brand verification takes ~2–3 business days.
+5. **CASA security assessment** (required for restricted scopes accessible via a
+   server, and as a general gate for restricted-scope production): Google charges
+   nothing, but you engage and pay an App Defense Alliance assessor directly.
+   Target assurance level **AL2**; on passing you get a Letter of Validation.
+   **Must be renewed every 12 months.** No official price; third-party assessors
+   publicly quote roughly **$500–$4,500/yr** depending on tier.
+
+### Don't need unlimited users?
+Two no-review options, both using the same embedded client:
+- **Production, unverified** — up to 100 users total (permanent lifetime cap),
+  one-time warning, **no weekly re-auth**. Best quick path.
+- **Verification exemptions** — personal use (only you / a few people you know) and
+  internal Workspace-org use are exempt from verification entirely.
+
+### Or keep "bring your own client_secret.json"
+Don't set `GOOGLE_CLIENT_SECRET_JSON`, and each user creates their own OAuth
+client (the README walkthrough). No verification, no embedded secret — developer-
+oriented, not turnkey for non-technical users.

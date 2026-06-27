@@ -1,8 +1,10 @@
 """Configuration, paths, and persistence for DocToPDF.
 
-- The OAuth app secret (``client_secret.json``) lives in the project root. Cached
-  credentials live there too: a legacy single ``token.json`` (auto-migrated) and,
-  for multi-account, a ``tokens/`` dir + an ``accounts.json`` index (see
+- The OAuth app secret (``client_secret.json``) is resolved (in priority order)
+  from the app-support dir, the packaged ``.app`` bundle's Resources, or the
+  project root — see :func:`_resolve_client_secret_path`. Cached credentials live
+  in the project root: a legacy single ``token.json`` (auto-migrated) and, for
+  multi-account, a ``tokens/`` dir + an ``accounts.json`` index (see
   :mod:`accounts`). All are gitignored.
 - User config (watched doc id, output dir, poll interval, …) is persisted to
   ``~/Library/Application Support/DocToPDF/config.json``.
@@ -12,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -22,11 +25,36 @@ from typing import Any
 # Project root = the directory that contains the ``doctopdf`` package.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-CLIENT_SECRET_PATH = PROJECT_ROOT / "client_secret.json"
-TOKEN_PATH = PROJECT_ROOT / "token.json"
-
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "DocToPDF"
 CONFIG_PATH = APP_SUPPORT_DIR / "config.json"
+TOKEN_PATH = PROJECT_ROOT / "token.json"
+
+
+def _resolve_client_secret_path() -> Path:
+    """Locate the OAuth ``client_secret.json``, in priority order:
+
+    1. A user-supplied copy in the app-support dir — lets anyone drop in their own
+       OAuth client without touching the bundle.
+    2. The copy embedded inside the packaged ``.app`` (``Contents/Resources``) —
+       so a distributed build ships its own OAuth client and end users do no
+       Google setup.
+    3. The project root — for running from source.
+
+    Returns the first that exists; otherwise the project-root path (so the
+    "Missing client_secret.json" guidance still points somewhere sensible).
+    """
+    user = APP_SUPPORT_DIR / "client_secret.json"
+    if user.exists():
+        return user
+    if getattr(sys, "frozen", False):  # py2app bundle
+        bundled = (Path(sys.executable).resolve().parent.parent
+                   / "Resources" / "client_secret.json")
+        if bundled.exists():
+            return bundled
+    return PROJECT_ROOT / "client_secret.json"
+
+
+CLIENT_SECRET_PATH = _resolve_client_secret_path()
 
 # OAuth scope — read-only Drive covers both metadata reads and PDF export.
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]

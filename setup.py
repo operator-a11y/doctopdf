@@ -17,9 +17,18 @@ other Macs (right-click → Open, or notarize with an Apple Developer account fo
 clean one-click open). And like the source app, the bundle still needs your own
 ``client_secret.json`` OAuth credentials to authorize Google Drive.
 """
+import os
+
 from setuptools import setup
 
 APP = ["packaging/launcher.py"]
+
+# Embed the OAuth client into the bundle when one is present at build time (the
+# release CI writes it from the GOOGLE_CLIENT_SECRET_JSON secret). Lands in
+# Contents/Resources/, where config._resolve_client_secret_path() finds it — so
+# the distributed app ships its own OAuth client and end users do no Google
+# setup. Without it, the build is a "bring-your-own client_secret.json" app.
+RESOURCES = [f for f in ["client_secret.json"] if os.path.exists(f)]
 
 OPTIONS = {
     "plist": {
@@ -63,6 +72,8 @@ OPTIONS = {
         "tkinter",
         "pytest",
     ],
+    # Embedded OAuth client (only when present at build time).
+    "resources": RESOURCES,
 }
 
 setup(

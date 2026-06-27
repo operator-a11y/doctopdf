@@ -1,3 +1,4 @@
+import Link from "next/link";
 import {
   ArrowRight,
   Bell,
@@ -325,6 +326,7 @@ python -m doctopdf`}
             <a href={site.repo} className="transition-colors hover:text-white">GitHub</a>
             <a href={site.readme} className="transition-colors hover:text-white">Docs</a>
             <a href={site.releases} className="transition-colors hover:text-white">Releases</a>
+            <Link href="/privacy" className="transition-colors hover:text-white">Privacy</Link>
           </div>
         </div>
         <p className="mt-8 text-center text-xs text-neutral-400">

@@ -60,6 +60,21 @@ jobs:
             "nh3>=0.2" \
             py2app
 
+      - name: Embed OAuth client (optional)
+        # If the GOOGLE_CLIENT_SECRET_JSON repo secret is set, write it so
+        # setup.py bundles it into Contents/Resources — the distributed app then
+        # ships its own OAuth client and end users do zero Google setup. Without
+        # the secret, this is a no-op and the build is bring-your-own-credentials.
+        env:
+          GOOGLE_CLIENT_SECRET_JSON: ${{ secrets.GOOGLE_CLIENT_SECRET_JSON }}
+        run: |
+          if [ -n "${GOOGLE_CLIENT_SECRET_JSON:-}" ]; then
+            printf '%s' "$GOOGLE_CLIENT_SECRET_JSON" > client_secret.json
+            echo "Embedded an OAuth client into the build."
+          else
+            echo "No GOOGLE_CLIENT_SECRET_JSON secret set — building bring-your-own-credentials."
+          fi
+
       - name: Build universal2 .app
         # Belt-and-suspenders: build any compiled stub for both arches too.
         run: ARCHFLAGS="-arch x86_64 -arch arm64" /tmp/bv/bin/python setup.py py2app
