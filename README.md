@@ -46,12 +46,21 @@ This cannot be automated — Google requires you to create your own OAuth client
    - Add **your own Google account** under **Test users** (otherwise auth is blocked).
 4. **Create OAuth client credentials**: APIs & Services → Credentials →
    **Create Credentials → OAuth client ID** → Application type **Desktop app**.
-   - Click **Download JSON** and save it as **`client_secret.json`** in the
-     project root (the folder containing this README). It is gitignored.
+   - Click **Download JSON** and save it as **`client_secret.json`**:
+     - **Running from source:** in the **project root** (the folder containing this
+       README). It is gitignored.
+     - **Using the downloaded `.app`:** put it in
+       **`~/Library/Application Support/DocToPDF/`** (create the folder if needed) —
+       the app checks there. (The `.app` is a sealed bundle, so you can't drop it
+       "next to" the app.)
 
 On first launch the app opens your browser to authorize **read-only Drive**
 access. After you approve, a `token.json` is cached locally (chmod 600,
 gitignored) and refreshed automatically from then on — you won't be asked again.
+
+> Because the app stays in **Testing** publishing status, add each Google account
+> you'll use under **Test users**, and note Google expires Testing-mode
+> authorizations after 7 days — the app silently re-authorizes when that happens.
 
 ---
 
