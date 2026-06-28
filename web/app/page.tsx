@@ -254,6 +254,8 @@ export default function Home() {
                   native on Apple silicon &amp; Intel</span>. It&apos;s an unsigned preview, so on
                   first open right-click the app → Open, then{" "}
                   <span className="text-neutral-200">just sign in</span> — no Google setup needed.
+                  Includes web-page monitoring; the local knowledge base + MCP server run from
+                  source.
                 </p>
                 <a
                   href={site.download}

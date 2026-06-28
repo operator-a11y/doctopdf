@@ -76,6 +76,12 @@ one.
 
 ## Install & run
 
+> **Downloaded app vs. from source.** The [downloaded app](https://github.com/operator-a11y/doctopdf/releases/latest)
+> includes everything **except** the local **RAG knowledge base**, the **MCP
+> server**, and **JS-rendered** web monitoring — those need running from source
+> (below). Core export, change intelligence, alerts/digests, git history,
+> multi-account, publishing, and **static/HTML web monitoring** are all in the app.
+
 Requires **Python 3.11+** and macOS.
 
 ```bash
