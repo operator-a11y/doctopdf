@@ -8,6 +8,8 @@ watch list, managed via "Add Doc or Folder…") is preserved untouched.
 
 from __future__ import annotations
 
+import os
+
 import objc
 from AppKit import (
     NSAlert,
@@ -19,6 +21,8 @@ from AppKit import (
     NSControlStateValueOn,
     NSFont,
     NSMakeRect,
+    NSModalResponseOK,
+    NSOpenPanel,
     NSPopUpButton,
     NSSecureTextField,
     NSSwitchButton,
@@ -30,7 +34,7 @@ from AppKit import (
     NSWindowStyleMaskClosable,
     NSWindowStyleMaskTitled,
 )
-from Foundation import NSObject
+from Foundation import NSObject, NSURL
 
 from . import config, launchagent
 
@@ -65,6 +69,16 @@ def _check(view, text, val, x, y, w=360):
     b.setButtonType_(NSSwitchButton)
     b.setTitle_(text)
     b.setState_(NSControlStateValueOn if val else NSControlStateValueOff)
+    view.addSubview_(b)
+    return b
+
+
+def _button(view, title, target, action, x, y, w=92, h=24):
+    b = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
+    b.setTitle_(title)
+    b.setBezelStyle_(1)  # rounded, matches Save/Cancel
+    b.setTarget_(target)
+    b.setAction_(action)
     view.addSubview_(b)
     return b
 
@@ -117,7 +131,10 @@ class PreferencesController(NSObject):
         v = self._tab(tabs, "General")
         y = CONTENT_TOP
         _label(v, "Poll interval (s):", 14, y + 2); self.poll = _field(v, cfg.get("poll_interval", 10), 175, y, 70); y -= 32
-        _label(v, "Output folder:", 14, y + 2); self.outdir = _field(v, cfg.get("output_dir", "~/Desktop"), 175, y, 350); y -= 32
+        _label(v, "Output folder:", 14, y + 2)
+        self.outdir = _field(v, cfg.get("output_dir", "~/Desktop"), 175, y, 255)
+        _button(v, "Choose…", self, "chooseFolder:", 436, y - 1, 92)
+        y -= 32
         _label(v, "Formats:", 14, y + 2); self.formats = _field(v, ", ".join(cfg.get("formats") or ["pdf"]), 175, y, 350); y -= 18
         _label(v, "Docs: pdf docx md … · Sheets: pdf xlsx csv · Slides: pdf pptx", 175, y, 360, size=9); y -= 30
         self.notify = _check(v, "Show a notification on each export", cfg.get("notify"), 14, y); y -= 28
@@ -184,6 +201,28 @@ class PreferencesController(NSObject):
     def show(self) -> None:
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         self.window.makeKeyAndOrderFront_(None)
+
+    def chooseFolder_(self, _sender) -> None:
+        """Native folder picker for the Output folder field. Stores the chosen
+        path back into the field (tilde-abbreviated under the home dir), so Save
+        persists it like a typed path."""
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(False)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(False)
+        panel.setCanCreateDirectories_(True)
+        panel.setPrompt_("Choose")
+        panel.setMessage_("Choose the folder DocToPDF exports into")
+        current = os.path.expanduser((self.outdir.stringValue() or "~/Desktop").strip())
+        if os.path.isdir(current):
+            panel.setDirectoryURL_(NSURL.fileURLWithPath_(current))
+        if panel.runModal() != NSModalResponseOK:
+            return
+        path = panel.URLs()[0].path()
+        home = os.path.expanduser("~")
+        if path == home or path.startswith(home + os.sep):
+            path = "~" + path[len(home):]
+        self.outdir.setStringValue_(path)
 
     def cancel_(self, _sender) -> None:
         self.window.close()
