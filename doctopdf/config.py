@@ -2,10 +2,11 @@
 
 - The OAuth app secret (``client_secret.json``) is resolved (in priority order)
   from the app-support dir, the packaged ``.app`` bundle's Resources, or the
-  project root — see :func:`_resolve_client_secret_path`. Cached credentials live
-  in the project root: a legacy single ``token.json`` (auto-migrated) and, for
+  project root — see :func:`client_secret_path`. Cached credentials live under
+  ``STATE_DIR``: a legacy single ``token.json`` (auto-migrated) and, for
   multi-account, a ``tokens/`` dir + an ``accounts.json`` index (see
-  :mod:`accounts`). All are gitignored.
+  :mod:`accounts`). ``STATE_DIR`` is the app-support dir in a packaged build
+  (the bundle is read-only) and the project root from source (gitignored).
 - User config (watched doc id, output dir, poll interval, …) is persisted to
   ``~/Library/Application Support/DocToPDF/config.json``.
 """
@@ -27,7 +28,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "DocToPDF"
 CONFIG_PATH = APP_SUPPORT_DIR / "config.json"
-TOKEN_PATH = PROJECT_ROOT / "token.json"
+
+# Where mutable credential state is persisted (legacy token.json, the tokens/
+# dir, and accounts.json — see :mod:`accounts`). This MUST be writable and
+# stable across launches. In a packaged ``.app`` the bundle is read-only — worse,
+# a downloaded/quarantined app is run from a *translocated*, read-only copy at a
+# random path — so credential state must NOT live next to the code (PROJECT_ROOT
+# resolves inside the bundle when frozen). Use the always-writable app-support
+# dir there; keep the project root when running from source (gitignored, and
+# preserves existing dev setups).
+STATE_DIR = APP_SUPPORT_DIR if getattr(sys, "frozen", False) else PROJECT_ROOT
+TOKEN_PATH = STATE_DIR / "token.json"
 
 
 def client_secret_path() -> Path:

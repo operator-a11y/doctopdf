@@ -521,5 +521,52 @@ class BootstrapAndStampTests(unittest.TestCase):
         self.assertNotIn("account", ctl._watch[2])
 
 
+class TestPackagedStateDir(unittest.TestCase):
+    """Regression: in a packaged ``.app`` the bundle is read-only (and a
+    downloaded app is translocated to a read-only random path), so credential
+    state must live in the writable app-support dir — never next to the code.
+    Shipping it under PROJECT_ROOT broke sign-in persistence (endless re-login).
+
+    STATE_DIR is decided at import time from ``sys.frozen``, so assert it from a
+    fresh subprocess that sets ``sys.frozen`` before importing.
+    """
+
+    def _paths_with_frozen(self, frozen):
+        import os
+        import subprocess
+        import sys
+
+        repo = str(Path(__file__).resolve().parent.parent)
+        code = (
+            "import sys\n"
+            f"sys.frozen = {frozen!r}\n" if frozen else "import sys\n"
+        ) + (
+            "from doctopdf import config, accounts\n"
+            "print(config.STATE_DIR)\n"
+            "print(config.TOKEN_PATH)\n"
+            "print(accounts.TOKENS_DIR)\n"
+            "print(accounts.ACCOUNTS_PATH)\n"
+        )
+        env = {**os.environ, "PYTHONPATH": repo}
+        out = subprocess.check_output([sys.executable, "-c", code], env=env, text=True)
+        state, token, tokens_dir, accts = out.strip().splitlines()
+        return state, token, tokens_dir, accts
+
+    def test_packaged_state_lives_in_writable_app_support(self):
+        state, token, tokens_dir, accts = self._paths_with_frozen("macosx_app")
+        app_support = str(Path.home() / "Library" / "Application Support" / "DocToPDF")
+        self.assertEqual(state, app_support)
+        for p in (token, tokens_dir, accts):
+            self.assertTrue(p.startswith(app_support), f"{p} escaped app-support")
+            self.assertNotIn(".app/Contents/", p, f"{p} is inside the bundle (read-only)")
+
+    def test_source_state_stays_in_project_root(self):
+        state, token, tokens_dir, accts = self._paths_with_frozen(None)
+        repo = str(Path(__file__).resolve().parent.parent)
+        self.assertEqual(state, repo)
+        self.assertTrue(token.startswith(repo))
+        self.assertTrue(tokens_dir.startswith(repo))
+
+
 if __name__ == "__main__":
     unittest.main()

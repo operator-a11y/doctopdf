@@ -34,9 +34,10 @@ from google.oauth2.credentials import Credentials
 
 from . import config, drive
 
-# Per-account tokens + the index live next to the shared client_secret.json.
-TOKENS_DIR = config.PROJECT_ROOT / "tokens"
-ACCOUNTS_PATH = config.PROJECT_ROOT / "accounts.json"
+# Per-account tokens + the index live under STATE_DIR — the writable app-support
+# dir in a packaged build (the bundle is read-only), the project root from source.
+TOKENS_DIR = config.STATE_DIR / "tokens"
+ACCOUNTS_PATH = config.STATE_DIR / "accounts.json"
 
 # Serializes read-modify-write of the index so concurrent mutators (worker,
 # menu, and the background auth thread) can't lose an update. Reads don't need
