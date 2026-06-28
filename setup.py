@@ -51,8 +51,8 @@ OPTIONS = {
         "CFBundleName": "DocToPDF",
         "CFBundleDisplayName": "DocToPDF",
         "CFBundleIdentifier": "com.doctopdf.app",
-        "CFBundleShortVersionString": "0.1.7",
-        "CFBundleVersion": "0.1.7",
+        "CFBundleShortVersionString": "0.1.8",
+        "CFBundleVersion": "0.1.8",
         "LSUIElement": True,            # menu-bar agent: no Dock icon
         "NSHighResolutionCapable": True,
     },

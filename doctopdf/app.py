@@ -49,7 +49,7 @@ from AppKit import (
 from Foundation import NSMakeRect, NSObject
 
 from . import (accounts, alerts, audit, config, digest, drive, launchagent,
-               pipeline, prefs, publish, rag, summarize, web)
+               pipeline, polllog, prefs, publish, rag, summarize, web)
 from .accounts import AccountAuthError
 from .drive import AuthFlowError, DriveError, ReauthRequired
 from .pipeline import sanitize_filename  # re-exported for convenience
@@ -675,6 +675,8 @@ class DocToPDFController(NSObject):
     @objc.python_method
     def _poll_all(self, watch: list, force: bool) -> None:
         targets, errors = self._resolve_targets(watch)
+        for e in errors:  # heartbeat for targets that failed to even resolve
+            polllog.log(f"(resolve) {e}")
         notes = list(errors)  # resolve errors + per-file export errors + git/hook warnings
         completed = True
         for t in targets:
@@ -735,6 +737,8 @@ class DocToPDFController(NSObject):
         """Export one target if changed. Returns a non-fatal warning string or None."""
         fid, name, modified, gtype = t["id"], t["name"], t["modified"], t["gtype"]
         if not (force or modified != self._modified.get(fid)):
+            # Heartbeat: loop is alive but Google reports the same modifiedTime.
+            polllog.log(f"{name}  mtime={modified}  (no change)")
             return None
 
         self._update_state(kind="exporting")
@@ -747,9 +751,11 @@ class DocToPDFController(NSObject):
         except AccountAuthError as exc:
             # Record it so the account's row offers targeted re-auth.
             self._drop_account(t.get("account"), str(exc))
+            polllog.log(f"{name}  mtime={modified}  -> ERROR {exc}")
             return str(exc)
         except ReauthRequired as exc:
             self._drop_account(t.get("account"), str(exc))
+            polllog.log(f"{name}  mtime={modified}  -> ERROR {exc}")
             return str(exc)
 
         primary = result.get("primary")
@@ -761,6 +767,8 @@ class DocToPDFController(NSObject):
                 self._state["last_pdf_path"] = str(primary)
                 self._recent.appendleft({"time": now, "path": str(primary), "name": name})
                 self._recent_dirty = True
+        polllog.log(f"{name}  mtime={modified}  -> exported "
+                    f"({', '.join(result.get('written', {}).keys()) or '—'})")
 
         new_text = result.get("text")
         old_text = self._prev_text.get(fid)
