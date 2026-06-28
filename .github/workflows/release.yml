@@ -49,7 +49,9 @@ jobs:
           "$PYBIN" -m venv /tmp/bv
           /tmp/bv/bin/python -m pip install --upgrade pip
           # Only the deps the bundle actually includes; pip selects universal2
-          # wheels automatically on a universal2 interpreter.
+          # wheels automatically on a universal2 interpreter. trafilatura/bs4/lxml
+          # power web-page monitoring (they pull charset_normalizer etc.); all have
+          # universal2 or pure wheels, so the bundle stays universal2.
           /tmp/bv/bin/pip install \
             pyobjc-framework-Cocoa \
             google-api-python-client \
@@ -58,6 +60,9 @@ jobs:
             requests \
             "markdown>=3.4" \
             "nh3>=0.2" \
+            "trafilatura>=2.0" \
+            "beautifulsoup4>=4.11" \
+            "lxml>=5.0" \
             py2app
 
       - name: Embed OAuth client (optional)

@@ -4,24 +4,40 @@ Build a standalone ``.app`` bundle:
 
     .venv/bin/python setup.py py2app
 
-It's a menu-bar (agent) app — ``LSUIElement`` hides the Dock icon. The heavy,
-*optional* dependencies (the local RAG vector store via ``chromadb`` and the
-Playwright browser renderer / ``trafilatura`` extractor) are EXCLUDED to keep the
-bundle building and reasonably small; the app degrades gracefully without them —
-core Doc/Sheet/Slides/Drawing export, change alerts, git history, multi-account,
-and the publishing pipeline all still work. RAG, the MCP server, and JS-rendered
-web monitoring are disabled in the packaged build (run from source for those).
+It's a menu-bar (agent) app — ``LSUIElement`` hides the Dock icon. Core export,
+change alerts, git history, multi-account, publishing, and web-page monitoring
+(static + HTML, via trafilatura/bs4/lxml) are all bundled. Still EXCLUDED to keep
+the bundle building and reasonably small: the local RAG vector store
+(``chromadb`` + its heavy native deps) and the Playwright browser renderer
+(needs separate browser binaries). The app degrades gracefully without them, so
+RAG, the MCP server, and JS-rendered (browser) web monitoring are disabled in the
+packaged build (run from source for those).
 
 NOTE: this produces an *unsigned* bundle. macOS Gatekeeper will quarantine it on
 other Macs (right-click → Open, or notarize with an Apple Developer account for a
 clean one-click open). And like the source app, the bundle still needs your own
 ``client_secret.json`` OAuth credentials to authorize Google Drive.
 """
+import glob
 import os
 
 from setuptools import setup
 
 APP = ["packaging/launcher.py"]
+
+# charset_normalizer (a trafilatura dependency) ships a mypyc-compiled shared
+# module at the site-packages ROOT — a sibling of the package, named
+# "<hash>__mypyc.cpython-*.so" — which `packages` does not grab. Its compiled
+# submodules import it, so without it web extraction crashes at runtime. Find it
+# dynamically (the hash is version-specific) and force-include it.
+MYPYC_MODULES = []
+try:
+    import charset_normalizer  # noqa: E402 — build-time dependency probe
+    _site = os.path.dirname(os.path.dirname(charset_normalizer.__file__))
+    MYPYC_MODULES = [os.path.basename(p).split(".")[0]
+                     for p in glob.glob(os.path.join(_site, "*__mypyc.cpython-*.so"))]
+except Exception:  # noqa: BLE001 — pure-python charset_normalizer needs nothing extra
+    MYPYC_MODULES = []
 
 # Embed the OAuth client into the bundle when one is present at build time (the
 # release CI writes it from the GOOGLE_CLIENT_SECRET_JSON secret). Lands in
@@ -50,6 +66,13 @@ OPTIONS = {
         "google_auth_oauthlib",
         "googleapiclient",
         "markdown",
+        # Web-page monitoring (static + HTML extraction). Listed as full packages
+        # so their data files / native modules come along. charset_normalizer
+        # ships mypyc-compiled .so accelerators that must be copied whole.
+        "trafilatura",
+        "bs4",
+        "lxml",
+        "charset_normalizer",
     ],
     "includes": [
         "nh3",
@@ -58,16 +81,15 @@ OPTIONS = {
         "google.auth.transport.requests",
         "google.oauth2.credentials",
         "google_auth_httplib2",
+        *MYPYC_MODULES,   # charset_normalizer's mypyc shared module(s)
     ],
-    # Optional/heavy deps the app imports lazily and tolerates missing.
+    # Optional/heavy deps the app imports lazily and tolerates missing:
+    #   chromadb/onnxruntime → RAG (huge native deps); playwright → browser
+    #   renderer (needs separate browser binaries); mcp → CLI-only server.
     "excludes": [
         "chromadb",
         "playwright",
         "onnxruntime",
-        "trafilatura",
-        "lxml",
-        "bs4",
-        "beautifulsoup4",
         "mcp",
         "tkinter",
         "pytest",
