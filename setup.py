@@ -73,6 +73,10 @@ OPTIONS = {
         "bs4",
         "lxml",
         "charset_normalizer",
+        # justext is trafilatura's fallback extractor (favor_recall path); it
+        # reads stoplist files from its own dir, so it must be a real package
+        # dir, not zipped.
+        "justext",
     ],
     "includes": [
         "nh3",
