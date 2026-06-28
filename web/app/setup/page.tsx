@@ -90,12 +90,19 @@ export default function Setup() {
     <main className="mx-auto max-w-3xl px-6 py-20">
       <a href="/" className="text-sm text-indigo-400 hover:text-indigo-300">← {site.name}</a>
       <h1 className="mt-6 text-3xl font-bold tracking-tight text-white sm:text-4xl">
-        Set up Google access
+        Use your own Google credentials
       </h1>
-      <p className="mt-4 text-[15px] leading-relaxed text-neutral-400">
-        {site.name} uses <span className="text-neutral-200">your own</span> Google credentials
-        — nothing is shared with us, and your data stays on your Mac. This is a one-time setup
-        (~5 minutes).
+      <div className="mt-5 rounded-xl border border-indigo-500/20 bg-indigo-500/5 p-4 text-[15px] leading-relaxed text-neutral-300">
+        <span className="font-semibold text-white">Most people don&apos;t need this.</span> The
+        downloaded app already includes Google credentials — just launch it and sign in. This
+        page is the <span className="text-neutral-200">advanced</span> path: bring your own
+        OAuth client if you run {site.name} <span className="text-neutral-200">from source</span>,
+        or if you need to serve <span className="text-neutral-200">more than 100 users</span>.
+        Your data stays on your Mac either way.
+      </div>
+      <p className="mt-6 text-[15px] leading-relaxed text-neutral-400">
+        It&apos;s a one-time setup (~5 minutes). A <code className="code">client_secret.json</code>{" "}
+        you drop in overrides the bundled one.
       </p>
 
       <ol className="mt-10 space-y-8">

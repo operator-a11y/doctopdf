@@ -221,13 +221,13 @@ export default function Home() {
 
             {/* Honest requirements callout */}
             <div className="mt-14 rounded-2xl border border-amber-500/20 bg-amber-500/5 p-6">
-              <h3 className="font-semibold text-amber-200">Before you start</h3>
+              <h3 className="font-semibold text-amber-200">Good to know</h3>
               <ul className="mt-3 space-y-2 text-sm text-neutral-300">
                 <li>· Runs on <span className="text-white">macOS</span> — it&apos;s a native menu-bar app.</li>
                 <li>
-                  · Needs your own <span className="text-white">Google Cloud OAuth client</span>{" "}
-                  (<code className="rounded bg-white/10 px-1 py-0.5 font-mono text-xs">client_secret.json</code>) —
-                  a one-time setup covered step by step in the{" "}
+                  · No Google setup — just <span className="text-white">sign in</span> on first
+                  launch (read-only Drive). Prefer your own OAuth client, or running from
+                  source? See the{" "}
                   <Link href={site.setup} className="text-amber-200 underline underline-offset-2 hover:text-amber-100">setup guide</Link>.
                 </li>
                 <li>· Optional: <span className="text-white">Ollama</span> for local AI summaries and the knowledge base.</li>
@@ -252,9 +252,8 @@ export default function Home() {
                 <p className="mt-2 flex-1 text-sm leading-relaxed text-neutral-400">
                   Grab the latest macOS build — <span className="text-neutral-200">universal2,
                   native on Apple silicon &amp; Intel</span>. It&apos;s an unsigned preview, so on
-                  first open right-click the app → Open. You also add your own Google OAuth
-                  client once — see the{" "}
-                  <Link href={site.setup} className="text-neutral-200 underline underline-offset-2 hover:text-white">setup guide</Link>.
+                  first open right-click the app → Open, then{" "}
+                  <span className="text-neutral-200">just sign in</span> — no Google setup needed.
                 </p>
                 <a
                   href={site.download}

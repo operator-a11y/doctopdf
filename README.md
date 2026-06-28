@@ -35,34 +35,42 @@ DocToPDF
 
 ---
 
-## One-time Google Cloud setup (you must do this once)
+## Connecting to Google
 
-This cannot be automated — Google requires you to create your own OAuth client.
+**Using the downloaded app?** There's nothing to set up. Launch DocToPDF, click
+**Sign in**, approve **read-only Drive** access in your browser (click through the
+one-time "unverified app" notice), and you're done. Your authorization is cached
+locally (chmod 600) and refreshed automatically — and your data never leaves your
+Mac. Add more accounts anytime under **Accounts ▸**.
 
-1. **Create a project** in the [Google Cloud Console](https://console.cloud.google.com/).
-2. **Enable the Google Drive API**: APIs & Services → Library → search
-   "Google Drive API" → **Enable**.
-3. **Configure the OAuth consent screen**: APIs & Services → OAuth consent screen.
-   - User type: **External**.
-   - Publishing status: **Testing** is fine.
-   - Add **your own Google account** under **Test users** (otherwise auth is blocked).
-4. **Create OAuth client credentials**: APIs & Services → Credentials →
-   **Create Credentials → OAuth client ID** → Application type **Desktop app**.
-   - Click **Download JSON** and save it as **`client_secret.json`**:
-     - **Running from source:** in the **project root** (the folder containing this
-       README). It is gitignored.
-     - **Using the downloaded `.app`:** put it in
-       **`~/Library/Application Support/DocToPDF/`** (create the folder if needed) —
-       the app checks there. (The `.app` is a sealed bundle, so you can't drop it
-       "next to" the app.)
+<details>
+<summary><b>Advanced: use your own Google credentials</b> (running from source, or
+serving more than 100 users)</summary>
 
-On first launch the app opens your browser to authorize **read-only Drive**
-access. After you approve, a `token.json` is cached locally (chmod 600,
-gitignored) and refreshed automatically from then on — you won't be asked again.
+The packaged app ships with an OAuth client, so most people never need this. You
+**do** need your own client if you run from source, or if you outgrow the bundled
+client's 100-user cap. Drop a `client_secret.json` in and it overrides the bundled
+one.
 
-> Because the app stays in **Testing** publishing status, add each Google account
-> you'll use under **Test users**, and note Google expires Testing-mode
-> authorizations after 7 days — the app silently re-authorizes when that happens.
+1. **Create a project** in the [Google Cloud Console](https://console.cloud.google.com/projectcreate).
+2. **Enable the Google Drive API**:
+   [enable it directly](https://console.cloud.google.com/apis/library/drive.googleapis.com)
+   (or APIs & Services → Library → "Google Drive API" → **Enable**).
+3. **Configure the OAuth consent screen** ([Branding](https://console.cloud.google.com/auth/branding)):
+   user type **External**. For yourself, **Testing** is fine — add your account
+   under [Test users](https://console.cloud.google.com/auth/audience). (Testing
+   authorizations expire after 7 days; the app silently re-authorizes. **Publish
+   app** to avoid that and serve up to 100 users.)
+4. **Create OAuth client credentials**
+   ([Credentials](https://console.cloud.google.com/apis/credentials) → Create
+   Credentials → OAuth client ID → **Desktop app**). **Download JSON** and save as
+   **`client_secret.json`**:
+   - **Running from source:** in the **project root** (this folder). Gitignored.
+   - **Downloaded `.app`:** in **`~/Library/Application Support/DocToPDF/`** — the
+     menu's **Set up Google access… → Reveal Folder** opens exactly this folder.
+     (The `.app` is a sealed bundle, so you can't drop it "next to" the app.)
+
+</details>
 
 ---
 
