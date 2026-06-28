@@ -251,8 +251,7 @@ export default function Home() {
                 <h3 className="text-lg font-semibold text-white">Download the app</h3>
                 <p className="mt-2 flex-1 text-sm leading-relaxed text-neutral-400">
                   Grab the latest macOS build — <span className="text-neutral-200">universal2,
-                  native on Apple silicon &amp; Intel</span>. It&apos;s an unsigned preview, so on
-                  first open right-click the app → Open, then{" "}
+                  native on Apple silicon &amp; Intel</span>. Then{" "}
                   <span className="text-neutral-200">just sign in</span> — no Google setup needed.
                   Includes web-page monitoring; the local knowledge base + MCP server run from
                   source.
@@ -263,7 +262,14 @@ export default function Home() {
                 >
                   <Download className="h-4 w-4" /> Download for macOS
                 </a>
-                <p className="mt-3 text-xs text-neutral-400">
+                <p className="mt-3 text-xs leading-relaxed text-neutral-400">
+                  <span className="text-neutral-300">First launch:</span> it&apos;s an unsigned
+                  preview, so macOS shows &ldquo;Apple cannot verify this app.&rdquo; Drag it to{" "}
+                  <span className="text-neutral-300">Applications</span>, then allow it once in{" "}
+                  <span className="text-neutral-300">System&nbsp;Settings → Privacy&nbsp;&amp;&nbsp;Security
+                  → Open&nbsp;Anyway</span>.
+                </p>
+                <p className="mt-2 text-xs text-neutral-400">
                   universal2 · macOS 11+ ·{" "}
                   <a href={site.releases} className="underline underline-offset-2 hover:text-white">all releases</a>
                 </p>

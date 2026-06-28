@@ -81,6 +81,13 @@ one.
 > server**, and **JS-rendered** web monitoring — those need running from source
 > (below). Core export, change intelligence, alerts/digests, git history,
 > multi-account, publishing, and **static/HTML web monitoring** are all in the app.
+>
+> **First launch on macOS (downloaded app).** It's an *unsigned* preview, so the
+> first time you open it macOS says **"Apple cannot verify this app."** To allow
+> it (a **one-time** step): drag the app to **Applications**, double-click it, then
+> open **System Settings → Privacy & Security**, scroll to the DocToPDF message
+> near the bottom and click **Open Anyway**. After that it opens normally and you
+> just sign in. *(On older macOS you can instead right-click the app → Open.)*
 
 Requires **Python 3.11+** and macOS.
 
